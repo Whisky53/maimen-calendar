@@ -1,6 +1,6 @@
-# 麦门日历 · 麦当劳活动力度与午饭规划助手
+# 麦门日历 · 麦当劳活动日历与全餐次规划助手
 
-> 今天麦当劳划不划算？这周哪天去吃最值？这顿多少卡？—— 一个 Skill 全替你算好。
+> 今天有什么活动？这一餐怎么选？预算够不够？—— 一个 Skill 全替你算好。
 
 「麦门日历」是一个基于**麦当劳官方 MCP Server** 的 WorkBuddy Skill，把
 **天气 → 活动力度 → 吃什么 → 热量 → 训练 → 日历提醒** 串成一条闭环。
@@ -15,7 +15,7 @@
 | 不知道今天麦当劳有没有活动 | 读取**真实活动日历**，每天算 0–100 分「活动力度」 |
 | 不知道哪天最划算 | 挑出未来最值得吃的日子，并说明理由 |
 | 不吃辣的、想喝冰的、预算 35 元 | 按硬约束过滤，再按天气/星座软偏好排序 |
-| 想省钱但懒得比价 | 调 `calculate-price` **服务端精算**同价位候选的应付价 |
+| 想省钱但懒得比价 | 对最多 6 套符合条件的候选调用 `calculate-price`，按应付价再次检查预算 |
 | 想知道这顿多少卡 | 接**麦当劳官方营养表**（160 条）算热量 |
 | 想配合减脂/增肌 | 热量收支平衡 + 训练计划（MET 消耗估算） |
 | 不想自己记提醒 | 导出 `.ics` 导入苹果/谷歌/Outlook 日历，或起本地订阅服务 |
@@ -110,6 +110,7 @@ node cli.mjs --slot-config dinner --disable
 node cli.mjs --pause --until 2026-10-07
 
 # 记忆：反馈 / 记录 / 查看 / 清空
+node run.mjs --record selected --record-id c
 node run.mjs --feedback like --feedback-id c
 node run.mjs --record consumed --record-id c
 node run.mjs --view
@@ -128,6 +129,12 @@ cd skills/maimen-calendar/scripts && node test.mjs
 # 麦门这一餐：39 组回归测试（离线，不需要 Token）
 cd skills/maimen-meal/scripts && node test.mjs
 ```
+
+### 真实链路回归测试
+```sh
+node skills/maimen-meal/scripts/integration.test.mjs
+```
+使用隔离的模拟 MCP 传输验证完整 CLI：核价涨价、全部失败、异常金额、仅饮品、空候选，以及展示记录不等于选择记录。此测试不需要 Token，也不调用真实账号。
 
 ### 本地订阅服务
 ```sh
@@ -231,6 +238,15 @@ maimen-calendar/
 ```
 
 ---
+
+## 本次优化的行为边界
+
+- 推荐输出只记录「展示」，用 `--record selected` 或 `--record consumed` 明确确认后才记录选择或吃过。
+- 真实请求失败、空菜单、核价失败时不回退到演示套餐。未配置 Token 或指定 `--demo` 仍可演示，结果明确标注。
+- 实付金额必须是正整数分；异常零元需到官方渠道确认。核价超预算的候选不会被推荐。
+- 最低价仅指本次已核价且符合约束的候选；菜单初筛和最多 6 套的核价上限意味着不保证全店或所有优惠组合的最低价。个性化推荐可以与本次最低价候选不同。
+- `drink-only` 只推荐饮品，明确冷热要求不把温度未知当成符合。
+- MCP 请求 15 秒超时，不自动重试领券等写操作。
 
 ## 设计原则
 

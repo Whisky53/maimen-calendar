@@ -168,23 +168,25 @@ export function comboCandidates(menu) {
  * @param {number} budgetCents 预算（分）；Infinity 表示不限
  * @returns {Array} 候选数组，可能为空
  */
-export function buildCandidates(menu, budgetCents = Infinity) {
+export function buildCandidates(menu, budgetCents = Infinity, { purpose = "full-meal", drink = "any" } = {}) {
   const affordable = (m) =>
-    typeof m.price === "number" && Number.isFinite(m.price) && m.price <= budgetCents;
+    Number.isSafeInteger(m.price) && m.price >= 0 && m.price <= budgetCents;
+
+  if (purpose === "drink-only") return menu.filter((m) => m.drink && !m.main && affordable(m) && (drink === "any" || m.temp === drink)).map((m) => ({ ...m, drinkOnly: true }));
 
   const combos = comboCandidates(menu).filter((m) => m.isCombo && affordable(m));
   if (combos.length >= 3) return combos;
 
   // 补充：真实"硬主食"（堡/鸡/卷/饭类）+ 最便宜饮品
   const { mains, drinks } = splitMenu(menu);
-  const cheapDrinks = drinks.filter(affordable).sort((a, b) => a.price - b.price);
-  const solidMains = mains.filter(affordable).sort((a, b) => a.price - b.price).slice(0, 6);
+  const cheapDrinks = drinks.filter((m) => affordable(m) && (drink === "any" || m.temp === drink)).sort((a, b) => a.price - b.price);
+  const solidMains = mains.filter((m) => affordable(m) && !COMBO_PATTERN.test(m.name)).sort((a, b) => a.price - b.price).slice(0, 6);
   const built = [];
   for (const m of solidMains) {
     const d = cheapDrinks.find((x) => m.price + x.price <= budgetCents);
     if (!d) continue;
     built.push({
-      code: m.code,
+      code: `${m.code}+${d.code}`,
       name: `${m.name} + ${d.name}`,
       price: m.price + d.price,
       priceStatus: "verified",
@@ -195,14 +197,15 @@ export function buildCandidates(menu, budgetCents = Infinity) {
         { productCode: m.code, quantity: 1 },
         { productCode: d.code, quantity: 1 },
       ],
-      drink: true,
+      drink: d.name,
       temp: d.temp,
       spicy: m.spicy,
       main: m.name,
     });
   }
   // 只返回合格集合；可能为空（上层据此返回无解），不回退全菜单
-  return [...combos, ...built];
+  const singles = purpose === "light-meal" ? menu.filter(affordable) : [];
+  return [...combos, ...built, ...singles];
 }
 
 /**
@@ -227,8 +230,8 @@ export function itemsForCandidate(c) {
  * @param {Array<{items:Array, label?:string}>} candidates items 为 [{productCode,quantity}]
  * @param {object} base calculate-price 的公共参数（storeCode 等）
  */
-export async function comparePrices(candidates, base = {}) {
-  if (!TOKEN) {
+export async function comparePrices(candidates, base = {}, calculate = null) {
+  if (!TOKEN && !calculate) {
     return {
       best: null,
       all: candidates.map((c) => ({ ...c, payableCents: null, status: "skipped" })),
@@ -238,18 +241,20 @@ export async function comparePrices(candidates, base = {}) {
   const results = [];
   for (const c of candidates) {
     try {
-      const quote = await mcd.calculatePrice({ ...base, items: c.items });
+      const quote = await (calculate || mcd.calculatePrice)({ ...base, items: c.items });
       if (!quote) {
         results.push({ ...c, payableCents: null, status: "failed", error: "空响应" });
         continue;
       }
       // 真实接口：price 单位为分
       const payableCents = quote.price ?? quote.payableCents ?? quote.totalCents ?? null;
+      const validPrice = Number.isSafeInteger(payableCents) && payableCents > 0;
       results.push({
         ...c,
         quote,
-        payableCents: typeof payableCents === "number" ? payableCents : null,
-        status: typeof payableCents === "number" ? "verified" : "failed",
+        payableCents: validPrice ? payableCents : null,
+        status: validPrice ? "verified" : "failed",
+        ...(validPrice ? {} : { error: "报价缺失或异常（零元报价需官方渠道确认）" }),
       });
     } catch (e) {
       results.push({ ...c, error: e.message, payableCents: null, status: "failed" });

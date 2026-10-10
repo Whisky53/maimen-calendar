@@ -16,11 +16,11 @@
   "recommendation":{ "id", "name", "priceCents", "price", "priceStatus", "category", "temp" } | null,
   "comparison":    { "status", "best", "all" } | null,
   "reasons":       [ "string" ],
-  "memory":        { "used", "historyCount", "lastPick", "excludedCount",
+  "memory":        { "used", "lastPick", "excludedCount",
                      "schemaVersion", "eventCount", "recentSameSlot", "crossSlotCount", "windowDays" },
   "reminder":      { "note" } | null,
   "warnings":      [ "string" ],
-  "dataStatus":    "verified" | "verified-unpriced" | "demo" | "failed" | "no-solution",
+  "dataStatus":    "verified" | "demo" | "failed" | "no-solution",
   "eligibleCount":  number
 }
 ```
@@ -46,7 +46,6 @@
 | 值 | 含义 | 用户可见话术要求 |
 | --- | --- | --- |
 | `verified` | 真实菜单 + 服务端核价成功 | 可称「价格已核验」 |
-| `verified-unpriced` | 真实菜单，但核价未成功 | 必须说明「以菜单标价为准」 |
 | `demo` | 演示数据 | 必须说明「非真实门店报价」 |
 | `failed` | 服务不可达或调用失败 | 必须说明服务不可用，**不得回退演示并伪装** |
 | `no-solution` | 业务无解（预算内无候选） | 说明原因，**不得回退全菜单** |
@@ -72,7 +71,7 @@
 - ❌ 「性价比很高」——无依据
 - ❌ 「根据大数据推荐」——编造来源
 
-核价失败时写「服务端核价未成功（原因），以下价格以菜单标价为准」，
+核价失败时说明失败原因，该候选不进入最终推荐；全部失败时 recommendation 为 null，
 不得仍写「服务端实付精算」。
 
 ---
@@ -101,7 +100,7 @@
 | 字段 | 含义 |
 | --- | --- |
 | `used` | 本次是否读取了历史记忆（`--no-memory` 时为 `false`） |
-| `historyCount` | 进入本次推荐的历史条数 |
+| `wroteEvents` | 本次写入事件数；展示不代表选择 |
 | `lastPick` | 最近同餐次吃过的餐品 id（用于避重） |
 | `excludedCount` | 硬排除集合大小（明确不喜欢等） |
 | `schemaVersion` | 记忆 Schema 版本（当前 `2`） |
@@ -125,6 +124,6 @@
 用户清空历史时，**由历史派生的偏好必须一并清除或重建**（§7.2）：
 
 - `inferred`（统计推断）→ 清空
-- `confirmed`（用户明确确认的忌口/过敏）→ 默认**保留**；仅显式全清时才一并删除
+- `confirmed`（用户明确确认的忌口/过敏）→ --clear-keep-confirmed 保留；--clear 全部删除
 
 不得出现「事件已清空、但偏好还在生效」的中间状态而不告知用户。

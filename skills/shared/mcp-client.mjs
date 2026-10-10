@@ -41,6 +41,8 @@ export async function callTool(name, args = {}) {
   let res;
   try {
     res = await fetch(MCP_URL, {
+      signal: AbortSignal.timeout(15000),
+      redirect: "error",
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -55,7 +57,7 @@ export async function callTool(name, args = {}) {
       }),
     });
   } catch (e) {
-    const err = new Error(`MCP ${name} 网络不可达：${e.message}`);
+    const err = new Error(`MCP ${name} 网络不可达或请求超时`);
     err.kind = "transport";
     throw err;
   }
@@ -70,7 +72,7 @@ export async function callTool(name, args = {}) {
 }
 
 /** 兼容 application/json 与 text/event-stream 两种响应。 */
-function parseMcpText(text) {
+export function parseMcpText(text) {
   const trimmed = (text || "").trim();
   if (!trimmed) return null;
   if (trimmed.startsWith("{")) return unwrap(JSON.parse(trimmed));
@@ -79,11 +81,9 @@ function parseMcpText(text) {
   for (let i = lines.length - 1; i >= 0; i--) {
     const payload = lines[i].slice(5).trim();
     if (!payload) continue;
-    try {
-      return unwrap(JSON.parse(payload));
-    } catch {
-      /* 继续找下一条 */
-    }
+    let parsed;
+    try { parsed = JSON.parse(payload); } catch { continue; }
+    if (parsed.result !== undefined || parsed.error) return unwrap(parsed);
   }
   return null;
 }
@@ -97,6 +97,11 @@ function unwrap(j) {
   }
   const r = j.result;
   if (!r) return null;
+  if (r.isError) {
+    const err = new Error("MCP 工具执行失败");
+    err.kind = "business";
+    throw err;
+  }
   // 真实接口优先返回 structuredContent
   if (r.structuredContent) return r.structuredContent;
   if (Array.isArray(r.content)) {
@@ -132,6 +137,8 @@ function extractData(sc, name) {
 export async function listTools() {
   if (!TOKEN) return null;
   const res = await fetch(MCP_URL, {
+    signal: AbortSignal.timeout(15000),
+    redirect: "error",
     method: "POST",
     headers: {
       "Content-Type": "application/json",

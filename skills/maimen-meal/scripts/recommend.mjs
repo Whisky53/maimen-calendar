@@ -85,8 +85,9 @@ export function normalizeMeal(raw, idx) {
     priceStatus: raw.priceStatus || (price === null ? "unknown" : "verified"),
     spicy: typeof raw.spicy === "boolean" ? raw.spicy : /辣/.test(text),
     // 是否含主食 / 是否含饮品，供用餐目的判定
-    hasMain: raw.main != null ? Boolean(raw.main) : /堡|卷|饭|鸡|牛|鱼|套餐|盒/.test(text),
-    hasDrink: Boolean(raw.drink) || /可乐|雪碧|红茶|咖啡|拿铁|美式|奶|汁|茶|水/.test(text),
+    hasMain: raw.hasMain ?? (raw.main != null ? Boolean(raw.main) : /堡|卷|饭|鸡|牛|鱼|套餐|盒/.test(text)),
+    hasDrink: raw.hasDrink ?? (Boolean(raw.drink) || /可乐|雪碧|红茶|咖啡|拿铁|美式|奶|汁|茶|水/.test(text)),
+    drinkOnly: raw.drinkOnly ?? (!raw.main && Boolean(raw.drink) && !raw.side),
     isCombo: Boolean(raw.isCombo),
     sign: raw.sign || "",
     motto: raw.motto || "",
@@ -137,19 +138,21 @@ export function recommend({
   const purpose = MEAL_PURPOSES[s.mealPurpose] ? s.mealPurpose : "full-meal";
   const purposeDef = MEAL_PURPOSES[purpose];
 
-  const source = meals && meals.length ? meals : DEMO_MEALS;
+  const source = meals ?? DEMO_MEALS;
   const pool = source.map(normalizeMeal);
   const { latest, recent } = summarizeHistory(history);
   const budgetCents = Math.round(s.budget * 100);
 
   // 1) 硬约束过滤（预算为硬上限；目的不符者排除；价格未知不进入预算内比较）
   const eligible = pool.filter((m) => {
-    if (m.price === null || !Number.isFinite(m.price) || m.price > budgetCents) return false;
+    if (!Number.isSafeInteger(m.price) || m.price < 0 || m.price > budgetCents) return false;
     if (s.noSpicy && m.spicy) return false;
-    if (s.drink !== "any" && m.temp !== s.drink && m.temp !== "any") return false;
+    if (s.drink !== "any" && m.temp !== s.drink) return false;
     if (latest.get(m.id) === "dislike") return false;
     if (excluded && excluded.has(m.id)) return false;
     if (purposeDef.needDrink && !m.hasDrink) return false;
+    if (purpose === "drink-only" && !m.drinkOnly) return false;
+    if (purposeDef.needMain && !m.hasMain) return false;
     return true;
   });
 

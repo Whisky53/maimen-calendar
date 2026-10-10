@@ -15,8 +15,10 @@
  */
 export function yuanToCents(yuan) {
   if (yuan === null || yuan === undefined || yuan === "") return null;
-  const n = typeof yuan === "number" ? yuan : Number(String(yuan).replace(/[^\d.\-]/g, ""));
-  if (!Number.isFinite(n)) return null;
+  const value = typeof yuan === "string" ? yuan.trim().replace(/^[¥￥]\s*/, "").replace(/\s*元$/, "") : yuan;
+  if (typeof value !== "number" && (typeof value !== "string" || !/^\d+(?:\.\d{1,2})?$/.test(value))) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0 || !Number.isSafeInteger(Math.round(n * 100))) return null;
   return Math.round(n * 100);
 }
 

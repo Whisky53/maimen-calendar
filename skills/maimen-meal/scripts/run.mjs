@@ -12,6 +12,7 @@
  * 有 MCD_MCP_TOKEN 时走真实 MCP：查门店 → 查真实菜单 → 候选组装 → 服务端核价。
  * 无 Token 时使用演示数据，并把来源标为 demo（不伪装成真实结果）。
  */
+import { recommendLive } from "./live-recommend.mjs";
 import { recommend, DEMO_MEALS, DEFAULT_SETTINGS, MEAL_SLOTS, MEAL_PURPOSES, inferSlot } from "./recommend.mjs";
 import { derivePreferences, supportedZodiacs } from "./preference.mjs";
 import {
@@ -152,7 +153,7 @@ if (args.zodiacs) {
     const store = loadMemory();
     // 便捷取值：默认取最近一次 selected 的 mealId
     const lastSelected = () => {
-      const list = listEvents(store, { type: EVENT_TYPES.SELECTED, limit: 1 });
+      const list = listEvents(store, { type: EVENT_TYPES.RECOMMENDATION_SHOWN, limit: 1 });
       return list[0] || null;
     };
     const resolveMeal = (explicit) => {
@@ -179,7 +180,7 @@ if (args.zodiacs) {
       }
       const meal = resolveMeal(args["record-id"]);
       // 同一动作重复执行不重复写入：用确定性 id + 当天 + 餐次
-      const day = new Date().toISOString().slice(0, 10);
+      const day = new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Shanghai" }).format(new Date());
       const ev = makeEvent({
         type: recordType,
         eventId: deterministicId(recordType, meal.id, day, args.slot || ""),
@@ -396,6 +397,8 @@ async function main() {
   let menuSource = "demo";
   let priceComparison = null;
   let noSolutionReason = null;
+  let runResult = null;
+  let comparisonScope = null;
 
   if (hasMcp() && !args.demo) {
     try {
@@ -419,51 +422,13 @@ async function main() {
       if (!menu.length) throw new Error("菜单为空");
       menuSource = "mcp:query-meals";
 
-      // ③ 候选组装（预算硬上限；为空即业务无解，不回退全菜单）
-      const candidates = buildCandidates(menu, budgetCents);
-      if (!candidates.length) {
-        noSolutionReason = `预算 ${money(budgetCents)} 内没有可作一餐的候选`;
-        dataStatus = "no-solution";
-      } else {
-        // ④ 硬约束 + 软偏好筛选（含餐次/目的）
-        const pre = recommend({
-          settings,
-          meals: candidates.map((c) => ({
-            id: c.code,
-            name: c.name,
-            main: c.main || c.name,
-            side: c.category,
-            drink: c.drink ? c.name : "",
-            temp: c.temp || "any",
-            price: c.price,
-            spicy: c.spicy,
-            isCombo: c.isCombo,
-          })),
-          history,
-          previous: lastPick,
-          preference,
-          excluded,
-        });
+      const live = await recommendLive({ menu, settings, storeCode: store.storeCode, history, previous: lastPick, preference, excluded });
+      runResult = live.result;
+      dataStatus = live.status;
+      priceComparison = live.comparison;
+      noSolutionReason = live.note;
+      comparisonScope = live.scope;
 
-        if (!pre.meal) {
-          noSolutionReason = pre.emptyReason || "当前条件下无可行方案";
-          dataStatus = "no-solution";
-        } else {
-          // ⑤ 只对「最终进入推荐的候选」做服务端核价，保证核价集合 == 最终过滤集合
-          const target = candidates.find((c) => c.code === pre.meal.id);
-          const shortlist = (target ? [target] : []).map((c) => ({
-            label: c.name,
-            items: itemsForCandidate(c),
-            detail: c,
-          }));
-          if (shortlist.length) {
-            priceComparison = await comparePrices(shortlist, { storeCode: store.storeCode });
-          }
-          meals = candidates;
-          dataStatus = priceComparison && priceComparison.status === "verified" ? "verified" : "verified-unpriced";
-          runResult = pre;
-        }
-      }
     } catch (e) {
       // 区分「传输失败」与「业务失败」，不回退演示、不伪装成真实精算
       dataStatus = "failed";
@@ -471,11 +436,10 @@ async function main() {
     }
   }
 
-  let runResult = null;
   if (!runResult) {
     runResult = recommend({
       settings,
-      meals,
+      meals: dataStatus === "demo" ? meals : [],
       history,
       previous: lastPick,
       preference,
@@ -512,25 +476,7 @@ async function main() {
         )
       )
         writtenEvents++;
-      // 选择事件：CLI 一次性输出即为「用户接受默认建议」
-      // 注意：这是弱偏好证据，不代表购买或吃过（§7.1）
-      if (
-        appendEvent(
-          memStore,
-          makeEvent({
-            type: EVENT_TYPES.SELECTED,
-            eventId: deterministicId("selected", finalMeal.id, day, slot),
-            mealId: finalMeal.id,
-            name: finalMeal.name,
-            mealSlot: slot,
-            mealPurpose: purpose,
-            priceCents: finalMeal.price,
-            storeCode: store ? store.storeCode : null,
-            sourceSnapshot: { source: "maimen-meal", status: dataStatus },
-          })
-        )
-      )
-        writtenEvents++;
+
     }
     purgeExpired(memStore, { retentionDays: Number(process.env.MAIMEN_RETENTION_DAYS) || DEFAULT_RETENTION_DAYS });
     saveMemory(memStore);
@@ -582,7 +528,7 @@ async function main() {
           name: finalMeal.name,
           priceCents: finalMeal.price,
           price: money(finalMeal.price),
-          priceStatus: finalMeal.price === null ? "unknown" : "verified",
+          priceStatus: dataStatus === "demo" ? "demo" : finalMeal.priceStatus,
           category: finalMeal.category || finalMeal.side || "",
           temp: finalMeal.temp || "any",
         }
@@ -618,6 +564,7 @@ async function main() {
       ? { note: "本工具只询价、不创建订单、不付款；请自行前往麦当劳官方渠道下单。" }
       : null,
     warnings: [
+      ...(comparisonScope ? [comparisonScope] : []),
       ...(failureNote ? [failureNote] : []),
       ...(noSolutionReason ? [`无解：${noSolutionReason}`] : []),
       ...(dataStatus === "demo" ? ["当前使用演示数据，非真实门店报价"] : []),
@@ -666,7 +613,7 @@ async function main() {
   } else {
     console.log(`👉 ${finalMeal.name}`);
     if (finalMeal.category) console.log(`   分类：${finalMeal.category}`);
-    console.log(`   标价：${money(finalMeal.price)}（符合条件共 ${runResult.count} 套）`);
+    console.log(`   本次参考价：${money(finalMeal.price)}（符合条件共 ${runResult.count} 套）`);
     console.log("   理由：");
     for (const r of payload.reasons) console.log(`     · ${r}`);
   }

@@ -17,7 +17,7 @@
 | 预算硬上限（无倍数放宽） | `recommend.mjs` 硬约束段 | 已实现 |
 | 价格未知保留 null | `mcp.mjs` `normalizeMenu`、`recommend.mjs` `normalizeMeal` | 已实现 |
 | 候选不足不回退全菜单 | `mcp.mjs` `buildCandidates` | 已实现 |
-| 服务端核价（只核最终推荐） | `mcp.mjs` `comparePrices` | 已实现 |
+| 服务端核价（最多 6 套候选，实付价复核预算） | `mcp.mjs` `comparePrices` | 已实现 |
 | 核价失败按对象标记来源 | `comparePrices` 返回 `status` | 已实现 |
 | 持久化事件流（七类事件） | `memory.mjs` `EVENT_TYPES` / `makeEvent` | 已实现 |
 | 事件幂等（同 eventId 不重复写） | `memory.mjs` `appendEvent` / `deterministicId` | 已实现 |
@@ -149,6 +149,6 @@ cd ../maimen-calendar/scripts && node test.mjs
 
 | 项 | 说明 |
 | --- | --- |
-| 优惠券叠加核价 | `query-store-coupons` / `auto-bind-coupons` 尚未接入核价链路，当前核价只用菜单标价 |
+| 优惠券叠加核价 | `query-store-coupons` / `auto-bind-coupons` 尚未接入核价链路，当前核价调用 calculate-price，但未主动枚举券组合 |
 | 订单 / 支付 | 项目明确不做，属设计边界而非缺陷 |
 | 真实 MCP 当前状态 | 本环境无 Token，未重跑 `verify-mcp.mjs`；上一次证据时间为 2026-10-10 |
