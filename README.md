@@ -112,7 +112,7 @@ MCD_MCP_TOKEN=xxx node serve.mjs --port 8787 --city 上海
 
 ```
 ① 查门店  query-nearby-stores
-   门店：麦当劳广州南站三楼A9检票口上方餐厅
+   门店：麦当劳（某交通枢纽店，storeCode 1400685）
    storeCode：1400685
 
 ② 查真实菜单  query-meals

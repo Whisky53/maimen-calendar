@@ -38,7 +38,7 @@
 | --- | --- | --- |
 | 握手 | `initialize` | 服务端 `mcd-mcp v1.0.0`，协议 2024-11-05 |
 | 权限 | `tools/list` | 返回 **35** 个 Tool |
-| 门店 | `query-nearby-stores` | `storeCode=1400685`（麦当劳广州南站店） |
+| 门店 | `query-nearby-stores` | `storeCode=1400685`（实测门店） |
 | 菜单 | `query-meals` | 13 分类 / **97 个真实餐品**，价格与官网一致 |
 | 比价 | `calculate-price` | 3 档候选精算，如「鸡薯双全盒 ¥31.00 / 酥脆无双套餐 ¥31.00 / 枫糖厚松饼猪柳堡三件套 ¥39.00」 |
 

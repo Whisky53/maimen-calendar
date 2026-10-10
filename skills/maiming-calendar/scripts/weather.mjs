@@ -248,7 +248,7 @@ function detectPrecipitation(r, f) {
 }
 
 /**
- * 温度分层规则（2026-10-10 优化为四层；珊姬选定的「标准」）。
+ * 温度分层规则（2026-10-10 优化为四层；使用者选定的「标准」）。
  * 返回带可解释 reason 的偏好信号，与 maiming-lunch 的 preference 结构一致。
  *
  * 设计要点：
