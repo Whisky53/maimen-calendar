@@ -1,5 +1,8 @@
 # 麦门日历 · 麦当劳活动日历与全餐次规划助手
-![Uploading image.png…]()
+
+<p align="center">
+  <img src="assets/maimen-calendar-poster-v1.png" alt="麦门日历像素风宣传海报：上班已经够难了，吃饭别再做选择题。活动看日历、预算不越界、到点记得吃、每一顿都算数。" width="640" />
+</p>
 
 > 今天有什么活动？这一餐怎么选？预算够不够？—— 一个 Skill 全替你算好。
 
