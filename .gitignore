@@ -38,3 +38,6 @@ desktop.ini
 # ── 编辑器 ──
 .vscode/
 .idea/
+
+# 报名操作手册（本地保留）
+.submit/
