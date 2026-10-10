@@ -1,0 +1,40 @@
+# ── 凭据（绝不入库）──
+.env
+.env.*
+!.env.example
+*.token
+mcp-config.json
+!.env.example
+
+# ── 依赖 ──
+node_modules/
+.pnp
+.pnp.js
+
+# ── 构建产物 ──
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# ── 运行时 / 临时 ──
+.wrangler/
+*.log
+npm-debug.log*
+run.log
+readback.json
+result.json
+
+# ── 导出产物 ──
+*.ics
+!examples/*.ics
+
+# ── 系统 ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── 编辑器 ──
+.vscode/
+.idea/
