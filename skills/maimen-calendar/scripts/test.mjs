@@ -27,8 +27,25 @@ import {
   expandPlan,
   TRAINING_TEMPLATES,
 } from "./nutrition.mjs";
-import { buildIcs, escapeText, foldLine, scheduleToIcs, toEvent, buildUid } from "./ics.mjs";
+import { buildIcs, escapeText, foldLine, scheduleToIcs, toEvent, buildUid, mergeSchedule, deliveryNote } from "./ics.mjs";
+import {
+  loadReminders,
+  saveReminders,
+  configureSlots,
+  setSlot,
+  shouldRemind,
+  pauseAll,
+  resumeAll,
+  skipDay,
+  snooze,
+  summarize,
+  TIME_TEMPLATES,
+  REPEAT_RULES,
+} from "./reminders.mjs";
 import { assert } from "node:console";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 let pass = 0;
 const failed = [];
@@ -506,6 +523,171 @@ check("VEVENT 含 SEQUENCE 与 LAST-MODIFIED（更新可识别）", () => {
 check("PRODID 使用 maimen 前缀", () => {
   const ics = buildIcs([{ uid: "u1", summary: "x", start: new Date(2026, 9, 10, 12, 0) }]);
   ok(ics.includes("-//maimen-calendar//"), "PRODID 应为 maimen-calendar");
+});
+
+// ── ICS 事件合并（§8.3）────────────────────────────
+check("合并：同日活动并入第一个用餐事件，不再单独建事件", () => {
+  const m = mergeSchedule([
+    { date: "2026-10-11", time: "10:00", kind: "campaign", slot: "campaign", title: "🎉 活动" },
+    { date: "2026-10-11", time: "11:30", kind: "meal", slot: "lunch", title: "午饭", desc: "原描述" },
+    { date: "2026-10-11", time: "18:30", kind: "meal", slot: "dinner", title: "晚饭" },
+  ]);
+  eq(m.length, 2, "4→2：活动被并入，早/晚不合并");
+  ok(!m.some((x) => x.kind === "campaign"), "不应再保留独立活动事件");
+  ok(m.find((x) => x.slot === "lunch").desc.includes("活动"), "活动应并入当天第一个用餐事件");
+});
+
+check("合并：顺序无关（活动在用餐之后也能并入）", () => {
+  const m = mergeSchedule([
+    { date: "2026-10-12", time: "11:30", kind: "meal", slot: "lunch", title: "午饭" },
+    { date: "2026-10-12", time: "10:00", kind: "campaign", slot: "campaign", title: "🎉 活动" },
+  ]);
+  eq(m.length, 1, "应合并为 1 条");
+  ok(m[0].desc.includes("活动"), "活动应并入午饭");
+});
+
+check("合并：不同餐次绝不合并（AC-34）", () => {
+  const m = mergeSchedule([
+    { date: "2026-10-13", time: "07:30", kind: "meal", slot: "breakfast", title: "早饭" },
+    { date: "2026-10-13", time: "11:30", kind: "meal", slot: "lunch", title: "午饭" },
+    { date: "2026-10-13", time: "18:30", kind: "meal", slot: "dinner", title: "晚饭" },
+  ]);
+  eq(m.length, 3, "三个餐次必须保持三条");
+});
+
+check("合并：重复刷新同一餐次不产生重复事件", () => {
+  const m = mergeSchedule([
+    { date: "2026-10-14", time: "11:30", kind: "meal", slot: "lunch", title: "午饭", desc: "A" },
+    { date: "2026-10-14", time: "11:30", kind: "meal", slot: "lunch", title: "午饭", desc: "B" },
+  ]);
+  eq(m.length, 1, "同 date+slot 应去重");
+  ok(m[0].desc.includes("A") && m[0].desc.includes("B"), "描述应合并且不丢信息");
+});
+
+check("合并：当天无用餐事件时保留独立活动事件", () => {
+  const m = mergeSchedule([
+    { date: "2026-10-15", time: "10:00", kind: "campaign", slot: "campaign", title: "🎉 活动" },
+  ]);
+  eq(m.length, 1, "无餐次可并入时应保留活动事件");
+});
+
+// ── 交付状态说明（§8.2）──────────────────────────
+check("交付说明：ICS 明确区分可承诺/不可承诺", () => {
+  const d = deliveryNote("ics");
+  ok(d && d.label === "ICS 文件", "应返回 ICS 交付说明");
+  ok(d.canPromise.some((x) => /已生成/.test(x)), "可承诺应含「文件已生成」");
+  ok(d.cannotPromise.some((x) => /已添加进你的日历/.test(x)), "不可承诺应含「已添加进你的日历」");
+  ok(d.cannotPromise.some((x) => /弹窗提醒/.test(x)), "不可承诺应含「一定弹窗」");
+});
+
+check("交付说明：订阅模式与宿主模式各有说明", () => {
+  ok(deliveryNote("subscription").cannotPromise.some((x) => /实时刷新/.test(x)), "订阅不可承诺实时刷新");
+  ok(deliveryNote("hostSchedule").note.includes("后台"), "宿主模式应说明后台能力依赖");
+  eq(deliveryNote("nope"), null, "未知模式返回 null");
+});
+
+// ── 提醒设置（§8.1）──────────────────────────────
+function tmpReminderPath() {
+  return join(mkdtempSync(join(tmpdir(), "maimen-r-")), "reminders.json");
+}
+
+check("提醒：首次合并不重复要求确认", () => {
+  let s = configureSlots(loadReminders("/nonexistent/x.json"), {
+    slots: [{ slot: "lunch", time: "11:45" }],
+  });
+  eq(s.configured, true, "首次设置后 configured 应为 true");
+  eq(s.slots.lunch.time, "11:45");
+  // 再次合并不传时间 → 保留已有 11:45
+  s = configureSlots(s, { slots: [{ slot: "lunch" }] });
+  eq(s.slots.lunch.time, "11:45", "未显式指定时间时必须保留原值");
+});
+
+check("提醒：每个餐次独立开关", () => {
+  let s = configureSlots({}, { slots: [{ slot: "lunch" }, { slot: "dinner" }] });
+  s = setSlot(s, "dinner", { enabled: false });
+  eq(shouldRemind(s, "lunch", "2026-10-12").remind, true, "lunch 应提醒");
+  eq(shouldRemind(s, "dinner", "2026-10-12").remind, false, "已关闭的 dinner 不应提醒");
+});
+
+check("提醒：周一至周五跳过周末（≠法定工作日）", () => {
+  let s = configureSlots({}, { slots: [{ slot: "lunch", repeat: REPEAT_RULES.WEEKDAYS }] });
+  // 2026-10-12 是周一，2026-10-17 是周六
+  const mon = shouldRemind(s, "lunch", "2026-10-12");
+  const sat = shouldRemind(s, "lunch", "2026-10-17");
+  eq(mon.remind, true, "周一应提醒");
+  eq(sat.remind, false, "周六不应提醒");
+  eq(sat.weekdayOnly, true, "应标记为「周一至周五」规则，便于输出提示");
+});
+
+check("提醒：用户标记的节假日被尊重", () => {
+  let s = configureSlots({}, { slots: [{ slot: "lunch", repeat: REPEAT_RULES.WEEKDAYS }] });
+  s.holidays = ["2026-10-13"]; // 周二，用户标记放假
+  eq(shouldRemind(s, "lunch", "2026-10-13").remind, false, "标记节假日不应提醒");
+});
+
+check("提醒：自定义重复日", () => {
+  let s = configureSlots({}, { slots: [{ slot: "lunch", repeat: REPEAT_RULES.CUSTOM, days: [1, 3] }] });
+  eq(shouldRemind(s, "lunch", "2026-10-12").remind, true, "周一应提醒"); // 周一
+  eq(shouldRemind(s, "lunch", "2026-10-13").remind, false, "周二不应提醒");
+  eq(shouldRemind(s, "lunch", "2026-10-14").remind, true, "周三应提醒");
+});
+
+check("提醒：暂停全天 / 恢复", () => {
+  let s = configureSlots({}, { slots: [{ slot: "lunch" }] });
+  s = pauseAll(s, { to: "2026-10-20" });
+  eq(shouldRemind(s, "lunch", "2026-10-15").remind, false, "暂停期内不应提醒");
+  eq(shouldRemind(s, "lunch", "2026-10-25").remind, true, "暂停期外应恢复提醒");
+  s = resumeAll(s);
+  eq(shouldRemind(s, "lunch", "2026-10-15").remind, true, "恢复后应提醒");
+});
+
+check("提醒：跳过当天某餐 / 全天", () => {
+  let s = configureSlots({}, { slots: [{ slot: "lunch" }, { slot: "dinner" }] });
+  s = skipDay(s, { date: "2026-10-16", slot: "lunch" });
+  eq(shouldRemind(s, "lunch", "2026-10-16").remind, false, "跳过的餐次当天不应提醒");
+  eq(shouldRemind(s, "dinner", "2026-10-16").remind, true, "未跳过的餐次应照常提醒");
+  s = skipDay(s, { date: "2026-10-17", slot: null });
+  eq(shouldRemind(s, "lunch", "2026-10-17").remind, false, "全天跳过应覆盖所有餐次");
+  eq(shouldRemind(s, "dinner", "2026-10-17").remind, false, "全天跳过应覆盖所有餐次");
+});
+
+check("提醒：延后本次仅跳过当天", () => {
+  let s = configureSlots({}, { slots: [{ slot: "lunch" }] });
+  s = snooze(s, { slot: "lunch", until: "2026-10-12T12:00:00+08:00" });
+  eq(shouldRemind(s, "lunch", "2026-10-12").remind, false, "延后当天不应再提醒");
+  eq(shouldRemind(s, "lunch", "2026-10-13").remind, true, "次日应恢复正常");
+});
+
+check("提醒：未配置餐次不提醒", () => {
+  const s = loadReminders("/nonexistent/y.json");
+  eq(shouldRemind(s, "lunch", "2026-10-12").remind, false, "未配置的餐次默认不提醒");
+});
+
+check("提醒：汇总含「周一至周五≠法定工作日」警示", () => {
+  const s = configureSlots({}, { slots: [{ slot: "lunch", repeat: REPEAT_RULES.WEEKDAYS }] });
+  const sum = summarize(s);
+  ok(sum.warnings.some((w) => /法定工作日/.test(w)), "汇总应含工作日语义警示");
+  ok(sum.slots[0].weekdayOnly === true, "该餐次应标记 weekdayOnly");
+});
+
+check("提醒：原子落盘（写临时文件后重命名）", () => {
+  const p = tmpReminderPath();
+  const s = configureSlots({}, { slots: [{ slot: "lunch", time: "11:40" }] });
+  eq(saveReminders(s, p), true, "保存应成功");
+  ok(existsSync(p), "文件应存在");
+  const back = loadReminders(p);
+  eq(back.slots.lunch.time, "11:40", "读感应与写入一致");
+  // 不应残留临时文件
+  const dir = join(p, "..");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+check("提醒：损坏的设置文件安全降级为默认", () => {
+  const p = tmpReminderPath();
+  writeFileSync(p, "{ 这不是合法 JSON", "utf8");
+  const s = loadReminders(p);
+  eq(s.configured, false, "损坏文件应回落为默认未配置状态");
+  rmSync(join(p, ".."), { recursive: true, force: true });
 });
 
 // ── 结果 ─────────────────────────────────────────

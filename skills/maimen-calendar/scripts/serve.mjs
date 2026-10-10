@@ -56,14 +56,19 @@ function generateIcs() {
     if (args.weight) cliArgs.push("--weight", args.weight);
     if (args.goal) cliArgs.push("--goal", args.goal);
     if (args.remind) cliArgs.push("--remind", args.remind);
+    // 多餐次订阅：把已保存的提醒设置一并交给日程生成（cli.mjs 会自动读取）
+    if (args.slots) cliArgs.push("--slots", args.slots);
     if (args.demo) cliArgs.push("--demo");
 
     execFile(process.execPath, cliArgs, { maxBuffer: 8 * 1024 * 1024, env: process.env }, async (err, stdout) => {
       if (err) return reject(err);
       try {
         const data = JSON.parse(stdout);
-        const { scheduleToIcs } = await import("./ics.mjs");
-        const ics = scheduleToIcs(data.schedule || [], { calendarName: "麦门日历 · 吃与练" });
+        const { scheduleToIcs, mergeSchedule } = await import("./ics.mjs");
+        // §8.3：订阅内容与导出文件用同一套合并规则，避免两条路径产出不一致
+        const ics = scheduleToIcs(mergeSchedule(data.schedule || []), {
+          calendarName: "麦门日历 · 吃与练",
+        });
         resolve(ics);
       } catch (e) {
         reject(e);

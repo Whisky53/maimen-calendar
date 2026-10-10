@@ -16,7 +16,8 @@
   "recommendation":{ "id", "name", "priceCents", "price", "priceStatus", "category", "temp" } | null,
   "comparison":    { "status", "best", "all" } | null,
   "reasons":       [ "string" ],
-  "memory":        { "used", "historyCount", "lastPick", "excludedCount" },
+  "memory":        { "used", "historyCount", "lastPick", "excludedCount",
+                     "schemaVersion", "eventCount", "recentSameSlot", "crossSlotCount", "windowDays" },
   "reminder":      { "note" } | null,
   "warnings":      [ "string" ],
   "dataStatus":    "verified" | "verified-unpriced" | "demo" | "failed" | "no-solution",
@@ -90,3 +91,40 @@
 
 `reminder` 只承载「只询价、不下单、不付款」的说明。
 真正的日历事件由 `maimen-calendar` 生成，UID 规则见该 Skill 的 `references/calendar-rules.md`。
+
+---
+
+## memory 段（§7.3 分析输出口径）
+
+`memory` 段必须如实反映「这次推荐用到了什么历史」，不得含糊其辞。
+
+| 字段 | 含义 |
+| --- | --- |
+| `used` | 本次是否读取了历史记忆（`--no-memory` 时为 `false`） |
+| `historyCount` | 进入本次推荐的历史条数 |
+| `lastPick` | 最近同餐次吃过的餐品 id（用于避重） |
+| `excludedCount` | 硬排除集合大小（明确不喜欢等） |
+| `schemaVersion` | 记忆 Schema 版本（当前 `2`） |
+| `eventCount` | 窗口内参与计算的事件数 |
+| `recentSameSlot` | 最近 3 次同餐次吃过的餐品 |
+| `crossSlotCount` | 跨餐次弱信号条数 |
+| `windowDays` | 读取窗口天数（默认 30） |
+
+### 口径要求（§7.3）
+
+**只有 `consumed` 才算「实际消费」。** 措辞必须区分：
+
+| 记录情况 | 允许的措辞 | 禁止的措辞 |
+| --- | --- | --- |
+| 有 ≥3 次 `consumed` | 「基于最近 N 次**实际消费**」 | — |
+| 只有 `selected` | 「最近 N 次**选择记录**（用户接受了建议，非实际消费），称『选择偏好』」 | ❌「你最近吃了 N 次」 |
+| 样本 < 3 | 「样本不足，暂不报告趋势」 | ❌ 硬凑出趋势结论 |
+
+### 清空与派生偏好
+
+用户清空历史时，**由历史派生的偏好必须一并清除或重建**（§7.2）：
+
+- `inferred`（统计推断）→ 清空
+- `confirmed`（用户明确确认的忌口/过敏）→ 默认**保留**；仅显式全清时才一并删除
+
+不得出现「事件已清空、但偏好还在生效」的中间状态而不告知用户。

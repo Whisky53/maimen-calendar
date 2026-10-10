@@ -45,6 +45,23 @@ description: 麦门这一餐 · 预算内帮你选、价格帮你核。按餐次
 | MCP 传输失败 | 标 `dataStatus=failed`，明确告知服务不可用，不回退演示 |
 | 部分候选核价失败 | 保留失败记录，说明「以菜单标价为准」 |
 | 记忆文件损坏 | 降级为空记忆，不中断推荐 |
+| 记忆 Schema 为旧的 v1 | 自动迁移到 v2，**数据不丢失** |
+| 只有选择记录、没有吃过记录 | 只能说「选择偏好」，**不得称「实际消费」** |
+
+## 记忆与偏好（§7）
+
+七类事件：`recommendation_shown` / `selected` / `consumed` / `rerolled` /
+`feedback` / `skipped` / `preference_updated`。
+
+三条不可违背：
+
+- **`selected` 是弱证据**：用户选了不代表买过、吃过，不得当消费
+- **确认优先于推断**：`confirmed`（用户明确说的）不被 `inferred`（统计推断）覆盖，
+  推断**不得升级为禁忌**
+- **同餐次优先**：重复度优先比同餐次，跨餐次只作弱信号（早餐喝咖啡不推断晚餐）；
+  但明确过敏与全局忌口跨餐次生效
+
+详细结构与命令见 `references/memory-schema.md`。
 
 ## 输出规则
 
@@ -85,6 +102,18 @@ node run.mjs --budget 40 --city 上海 --weather '{"tempC":32}'
 
 # 完整端到端联调自检（只询价，不下单）
 MCD_MCP_TOKEN=你的token node verify-mcp.mjs --city 上海 --budget 30
+
+# 记忆：反馈 → 记录 → 查看
+node run.mjs --feedback like --feedback-id c
+node run.mjs --record consumed --record-id c
+node run.mjs --view --view-type feedback
+
+# 记忆：明确偏好（不会被推断覆盖）
+node run.mjs --confirm-allergy 花生 --confirm-ban 冰淇淋
+node run.mjs --unconfirm 冰淇淋
+
+# 记忆：清空（保留明确确认的忌口）
+node run.mjs --clear-keep-confirmed
 ```
 
 ## 参数
@@ -102,6 +131,21 @@ MCD_MCP_TOKEN=你的token node verify-mcp.mjs --city 上海 --budget 30
 | `--store` | 门店 storeCode（跳过门店查询） | 无 |
 | `--no-memory` | 本次不读写历史记忆 | 关 |
 | `--json` / `--demo` / `--zodiacs` | 输出 JSON / 强制演示 / 列出星座 | 关 |
+
+### 记忆管理
+
+| 参数 | 说明 |
+| --- | --- |
+| `--record <consumed\|selected\|rerolled\|skipped>` | 记事件（配 `--record-id`，幂等） |
+| `--feedback <verdict> --feedback-id <id>` | 记反馈：`like` / `dislike` / `too_spicy` / `too_expensive` / `too_cold` / `too_hot` |
+| `--view [--view-type <type>]` | 查看事件与趋势口径 |
+| `--revoke <id>` | 撤销该餐品反馈（同步从 confirmed 摘除） |
+| `--confirm-dislike / --confirm-allergy / --confirm-ban <值>` | 明确确认偏好 |
+| `--unconfirm <id\|词>` | 取消某条明确确认 |
+| `--export` | 导出全部记忆为 JSON |
+| `--clear-keep-confirmed` | 清空事件与推断偏好，保留明确确认的忌口/过敏 |
+| `--clear` | 全清（含明确确认） |
+| `--purge` | 清理超过保留期的事件（默认 180 天） |
 
 ## 环境变量
 
@@ -136,7 +180,7 @@ references/
 
 ```bash
 cd scripts && node test.mjs
-# PASS: 预算 / 忌口 / 冷热 / 无解 / 明确排除 / 重抽避重复 / 星座 / 天气 / 偏好合成 / 归一化 / 餐次 / 用餐目的 / 价格未知 / 记忆
+# PASS: 预算 / 忌口 / 冷热 / 无解 / 明确排除 / 重抽避重复 / 星座 / 天气 / 偏好合成 / 归一化 / 餐次 / 用餐目的 / 价格未知 / 记忆 + 事件流v2 / 幂等 / 迁移 / 保留期 / 确认vs推断 / 趋势口径
 
 # 真实 MCP 端到端（需 Token）
 MCD_MCP_TOKEN=xxx node verify-mcp.mjs --city 上海 --budget 30

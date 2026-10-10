@@ -54,9 +54,27 @@
 - **基础代谢**：Mifflin-St Jeor 公式估算每日目标摄入。
 
 ### 4. 日历提醒与导出
+- **分餐次提醒**：每个餐次独立开关、时间与重复规则，持久化在 `~/.maimen/reminders.json`；
+  支持修改、关闭、跳过当天、暂停全天、延后本次。
 - 生成吃饭提醒 + 训练提醒，事件里明确写"请自行前往麦当劳官方渠道下单"。
 - 导出标准 **iCalendar**（零依赖，严格 RFC 5545：CRLF 换行、75 字节折行、转义、时区、VALARM）。
+- **稳定 UID + SEQUENCE**：同一事件重复导出是「更新」而非「新增」；
+  同一天不同餐次 UID 不同可共存；同日活动信息合并进用餐事件描述。
 - 可选启动本地订阅服务，用 `webcal://` 链接订阅到日历 App。
+
+> **交付状态如实说明**：ICS 文件只保证「文件已生成」，不承诺「已加进你的日历」或「一定弹窗」；
+> 订阅只保证「地址可用、内容可更新」，不承诺所有客户端实时刷新。
+> 是否真正提醒取决于你所用客户端与宿主能力。
+
+> ⚠️ 「周一至周五」**不等于法定工作日**。调休与节假日需可靠日历来源或用户自定义，本工具不做假定。
+
+### 5. 记忆与偏好学习
+- **七类事件**：展示 / 选择 / 吃过 / 换过 / 反馈 / 跳过 / 偏好更新，语义严格区分。
+- **`selected` ≠ `consumed`**：选了不代表吃过，只有确认吃过才算「实际消费」。
+- **确认优先于推断**：你明确说的忌口/过敏不会被统计推断覆盖，推断也不会升级成禁忌。
+- **同餐次优先**：早餐的偏好不污染晚餐；但过敏与全局忌口跨餐次生效。
+- **180 天保留 + 30 天窗口**：旧事件定期清理，窗口外不参与推荐但仍在本地。
+- 可查看、撤销、导出、清空；清空历史时由历史派生的推断偏好一并清除。
 
 ---
 
@@ -86,14 +104,29 @@ MCD_MCP_TOKEN=xxx node cli.mjs \
 cd skills/maimen-meal/scripts
 MCD_MCP_TOKEN=xxx node run.mjs --budget 35 --city 上海 --slot lunch
 
+# 提醒设置（持久化到 ~/.maimen/reminders.json，各餐次独立开关）
+node cli.mjs --setup-reminders --slots breakfast,lunch --remind-lunch 11:45
+node cli.mjs --slot-config dinner --disable
+node cli.mjs --pause --until 2026-10-07
+
+# 记忆：反馈 / 记录 / 查看 / 清空
+node run.mjs --feedback like --feedback-id c
+node run.mjs --record consumed --record-id c
+node run.mjs --view
+node run.mjs --confirm-allergy 花生
+node run.mjs --clear-keep-confirmed
+
 # 只做端到端联调自检（询价，不下单）
 MCD_MCP_TOKEN=xxx node verify-mcp.mjs
 ```
 
 ### 跑测试
 ```sh
-# 麦门日历：71 项回归测试（离线，不需要 Token）
+# 麦门日历：97 项回归测试（离线，不需要 Token）
 cd skills/maimen-calendar/scripts && node test.mjs
+
+# 麦门这一餐：39 组回归测试（离线，不需要 Token）
+cd skills/maimen-meal/scripts && node test.mjs
 ```
 
 ### 本地订阅服务
@@ -177,11 +210,12 @@ maimen-calendar/
     │   │   ├── calendar-rules.md
     │   │   └── data-sources.md
     │   └── scripts/
-    │       ├── cli.mjs          # 主入口
+    │       ├── cli.mjs          # 主入口（含提醒设置子命令）
     │       ├── weather.mjs      # 中国天气网适配 + 温度分层
     │       ├── campaign.mjs     # 活动力度评分引擎
     │       ├── nutrition.mjs    # 热量 + 训练
-    │       ├── ics.mjs          # RFC 5545 日历生成
+    │       ├── ics.mjs          # RFC 5545 日历生成 + 事件合并 + 交付状态
+    │       ├── reminders.mjs    # 分餐次提醒设置（持久化）
     │       ├── mcd.mjs          # 麦当劳 MCP 业务封装
     │       ├── serve.mjs        # 本地订阅服务
     │       └── test.mjs         # 回归测试
@@ -193,7 +227,7 @@ maimen-calendar/
         │   ├── memory-schema.md
         │   ├── output-contract.md
         │   └── acceptance.md
-        └── scripts/
+        └── scripts/             # run.mjs / memory.mjs / recommend.mjs / mcp.mjs / test.mjs
 ```
 
 ---
@@ -205,6 +239,8 @@ maimen-calendar/
 3. **力度是估算**：评分是启发式规则，输出必须注明"力度为估算"。
 4. **硬约束优先**：预算、忌口不被天气/活动力度突破。
 5. **数据可追溯**：每条输出都能说明来自「中国天气网」还是「麦当劳 MCP」。
+6. **不假称能力**：数据缺失保留 `unknown`，交付方式如实说明可承诺与不可承诺。
+7. **确认优先于推断**：用户明确说的不被统计推断覆盖，推断也不升级为禁忌。
 
 ---
 

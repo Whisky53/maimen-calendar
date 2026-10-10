@@ -27,7 +27,22 @@ import {
   expandPlan,
   MET_TABLE,
 } from "./nutrition.mjs";
-import { scheduleToIcs, toEvent } from "./ics.mjs";
+import { scheduleToIcs, toEvent, mergeSchedule, deliveryNote } from "./ics.mjs";
+import {
+  loadReminders,
+  saveReminders,
+  remindersPath,
+  configureSlots,
+  setSlot,
+  shouldRemind,
+  pauseAll,
+  resumeAll,
+  skipDay,
+  snooze,
+  summarize,
+  TIME_TEMPLATES,
+  REPEAT_RULES,
+} from "./reminders.mjs";
 import { writeFileSync } from "node:fs";
 
 const MONEY = (c) => `¥${(c / 100).toFixed(2)}`;
@@ -47,6 +62,8 @@ function parseArgs(argv) {
   }
   return out;
 }
+
+const line = (n = 56) => "─".repeat(n);
 
 const args = parseArgs(process.argv.slice(2));
 
@@ -71,12 +88,28 @@ if (args.help || args.h) {
   --json                输出 JSON
   --demo                强制离线演示（不调 MCP/天气网）
 
+提醒设置（持久化到 ~/.maimen/reminders.json，各餐次独立开关）：
+  --setup-reminders     首次设置：确认餐次/时间/时区/重复规则（配 --slots / --remind-<slot>）
+  --view-reminders      查看当前提醒设置
+  --slot-config <餐次>   修改某餐次的设置（可配 --enable / --disable / --remind-<slot>
+                        / --slot-budget <元> / --repeat daily|weekdays|custom / --repeat-days）
+  --pause [--until <日期>]  暂停提醒（可指定恢复到哪天）
+  --resume              恢复提醒
+  --skip-day <日期>      跳过某天（可配 --slot <餐次>，不带则跳过当天全部）
+  --snooze <餐次>        延后本次（配 --minutes <分钟>，默认 30）
+
 注意：--training 只接受模板名（fatLoss/muscle/maintain），--goal 只接受数值 kcal。
       两者语义不同，不可混用；写错会直接报错退出，不会静默忽略。
 
+      「周一至周五」不等于法定工作日：调休与节假日需可靠日历来源或用户自定义，
+      本工具不做假定，输出里会明示。
+
 示例：
   node cli.mjs --city 上海 --budget 40 --days 7 --ics ./maimen.ics
-  node cli.mjs --city 北京 --training fatLoss --weight 58 --goal 1600 --json`);
+  node cli.mjs --city 北京 --training fatLoss --weight 58 --goal 1600 --json
+  node cli.mjs --setup-reminders --slots breakfast,lunch --remind-lunch 11:45
+  node cli.mjs --pause --until 2026-10-07
+  node cli.mjs --view-reminders`);
   process.exit(0);
 }
 
@@ -111,6 +144,153 @@ for (const [k, min, max] of [
 }
 if (args.remind != null && !/^\d{1,2}:\d{2}$/.test(String(args.remind))) {
   fail(`--remind 需形如 HH:MM，收到 "${args.remind}"`);
+}
+
+// ══════════════════════════════════════════════════════════
+// 提醒设置子命令（需求说明书 §8.1：修改 / 关闭 / 跳过 / 暂停 / 延后）
+// 这些命令只读改 ~/.maimen/reminders.json，不跑天气与 MCP。
+// ══════════════════════════════════════════════════════════
+const REMINDER_SUBCMDS = [
+  "setup-reminders",
+  "view-reminders",
+  "slot-config",
+  "pause",
+  "resume",
+  "skip-day",
+  "snooze",
+];
+const isReminderCommand = REMINDER_SUBCMDS.some((k) => args[k] != null);
+
+if (isReminderCommand) {
+  const rs = loadReminders();
+  const out = { action: null, before: summarize(rs) };
+
+  // ── 首次设置 ──
+  if (args["setup-reminders"] != null) {
+    const raw = args.slots != null ? String(args.slots) : "breakfast,lunch,dinner";
+    const list = raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!list.length) fail("--setup-reminders 需用 --slots 指定至少一个餐次");
+    const entries = list.map((slot) => {
+      const t = args[`remind-${slot}`] != null ? String(args[`remind-${slot}`]) : null;
+      if (t != null && !/^\d{1,2}:\d{2}$/.test(t)) fail(`--remind-${slot} 需形如 HH:MM，收到 "${t}"`);
+      // 未显式指定时间时留 undefined：保留已有设置，首次才回落到模板默认值
+      return { slot, enabled: true, time: t || undefined };
+    });
+    const first = !rs.configured;
+    const merged = configureSlots(rs, { slots: entries, timezone: args.timezone });
+    const saved = saveReminders(merged);
+    out.action = "setup";
+    out.firstTime = first;
+    out.saved = saved;
+    out.after = summarize(merged);
+    out.message = first
+      ? "已完成首次提醒设置。之后修改设置不会重复要求确认。"
+      : "已更新提醒设置（已有餐次保留，仅增量合并）。";
+  }
+
+  // ── 修改某餐次 ──
+  else if (args["slot-config"] != null) {
+    const slot = String(args["slot-config"]);
+    if (!slot || slot === "true") fail("--slot-config 需要一个餐次名，如 --slot-config lunch");
+    const patch = {};
+    if (args.enable != null) patch.enabled = true;
+    if (args.disable != null) patch.enabled = false;
+    const t = args[`remind-${slot}`] != null ? String(args[`remind-${slot}`]) : null;
+    if (t != null) {
+      if (!/^\d{1,2}:\d{2}$/.test(t)) fail(`--remind-${slot} 需形如 HH:MM，收到 "${t}"`);
+      patch.time = t;
+    }
+    if (args["slot-budget"] != null) {
+      const b = Number(args["slot-budget"]);
+      if (!Number.isFinite(b) || b <= 0) fail(`--slot-budget 需要正数，收到 "${args["slot-budget"]}"`);
+      patch.budget = b;
+    }
+    if (args.repeat != null) {
+      const r = String(args.repeat);
+      if (!Object.values(REPEAT_RULES).includes(r)) {
+        fail(`--repeat 只接受 ${Object.values(REPEAT_RULES).join(" / ")}，收到 "${r}"`);
+      }
+      patch.repeat = r;
+    }
+    if (args["repeat-days"] != null) {
+      const days = String(args["repeat-days"])
+        .split(",")
+        .map((x) => Number(x.trim()))
+        .filter((n) => Number.isInteger(n) && n >= 0 && n <= 6);
+      if (!days.length) fail("--repeat-days 需形如 1,2,3（0=周日 … 6=周六）");
+      patch.days = days;
+      patch.repeat = REPEAT_RULES.CUSTOM;
+    }
+    if (!Object.keys(patch).length) fail("--slot-config 需要至少一个改动（--enable/--disable/--remind-<slot>/--slot-budget/--repeat）");
+    const merged = setSlot(rs, slot, patch);
+    out.saved = saveReminders(merged);
+    out.action = "slot-config";
+    out.slot = slot;
+    out.patch = patch;
+    out.after = summarize(merged);
+  }
+
+  // ── 暂停全天 ──
+  else if (args.pause != null) {
+    const until = args.until != null && args.until !== true ? String(args.until) : null;
+    if (until && !/^\d{4}-\d{2}-\d{2}$/.test(until)) fail(`--until 需形如 YYYY-MM-DD，收到 "${until}"`);
+    const merged = pauseAll(rs, { from: null, to: until, reason: "用户暂停" });
+    out.saved = saveReminders(merged);
+    out.action = "pause";
+    out.after = summarize(merged);
+    out.message = until ? `已暂停提醒，给到 ${until} 为止。` : "已暂停提醒（未设结束日期，用 --resume 恢复）。";
+  }
+
+  // ── 恢复 ──
+  else if (args.resume != null) {
+    const merged = resumeAll(rs);
+    out.saved = saveReminders(merged);
+    out.action = "resume";
+    out.after = summarize(merged);
+    out.message = "已恢复提醒。";
+  }
+
+  // ── 跳过某天 ──
+  else if (args["skip-day"] != null) {
+    const date = String(args["skip-day"]);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) fail(`--skip-day 需形如 YYYY-MM-DD，收到 "${date}"`);
+    const slot = args.slot != null && args.slot !== true ? String(args.slot) : null;
+    const merged = skipDay(rs, { date, slot });
+    out.saved = saveReminders(merged);
+    out.action = "skip-day";
+    out.message = slot ? `已跳过 ${date} 的「${slot}」。` : `已跳过 ${date} 当天的全部提醒。`;
+    out.after = summarize(merged);
+  }
+
+  // ── 延后本次 ──
+  else if (args.snooze != null) {
+    const slot = String(args.snooze);
+    if (!slot || slot === "true") fail("--snooze 需要一个餐次名，如 --snooze lunch");
+    const minutes = args.minutes != null ? Number(args.minutes) : 30;
+    if (!Number.isFinite(minutes) || minutes <= 0) fail(`--minutes 需要正数，收到 "${args.minutes}"`);
+    const merged = snooze(rs, { slot, minutes });
+    out.saved = saveReminders(merged);
+    out.action = "snooze";
+    out.until = merged.snooze[slot];
+    out.message = `已将「${slot}」本次提醒延后 ${minutes} 分钟（到 ${merged.snooze[slot]}）。`;
+    out.after = summarize(merged);
+  }
+
+  // ── 查看 ──
+  else if (args["view-reminders"] != null) {
+    out.action = "view";
+    out.after = summarize(rs);
+  }
+
+  if (args.json) {
+    console.log(JSON.stringify(out, null, 2));
+  } else {
+    printReminderHuman(out);
+  }
+  process.exit(0);
 }
 
 // 餐次定义（需求说明书 §5）：默认午餐；每个餐次有各自的默认提醒时间
@@ -170,7 +350,47 @@ const profile = {
 const trainingTplKey = args.training || null;
 const goalKcal = args.goal ? Number(args.goal) : null;
 
-const line = (n = 56) => "─".repeat(n);
+const WEEKDAY_CN = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+
+/** 提醒设置的文字输出。 */
+function printReminderHuman(out) {
+  const a = out.after || {};
+  console.log("⏰ 麦门日历 · 提醒设置");
+  console.log(line());
+  console.log(`存储：${remindersPath()}`);
+  console.log(`时区：${a.timezone || "-"}   首次确认：${a.configured ? "已完成" : "未完成"}`);
+  if (a.paused) {
+    console.log(`⏸️  已暂停：${a.paused.from || "（即刻）"} → ${a.paused.to || "（未定，用 --resume 恢复）"}`);
+  } else {
+    console.log("▶️  提醒运行中");
+  }
+  console.log(line());
+  const slots = a.slots || [];
+  if (!slots.length) {
+    console.log("（尚未配置任何餐次）");
+    console.log("  先运行：node cli.mjs --setup-reminders --slots breakfast,lunch,dinner");
+  } else {
+    console.log("各餐次设置：");
+    for (const s of slots) {
+      const state = s.enabled ? "✅ 开" : "⛔ 关";
+      const budget = s.budget != null ? ` · 预算 ¥${s.budget}` : "";
+      const repeat =
+        s.repeat === REPEAT_RULES.WEEKDAYS
+          ? " · 周一至周五"
+          : s.repeat === REPEAT_RULES.CUSTOM
+            ? ` · 自定义 ${(s.days || []).map((d) => WEEKDAY_CN[d]).join("/") || "-"}`
+            : " · 每天";
+      console.log(`   ${state}  ${s.slot.padEnd(10)} ${s.time}${budget}${repeat}`);
+    }
+  }
+  console.log(line());
+  if (out.message) console.log(`✔ ${out.message}`);
+  if (out.firstTime) {
+    console.log("ℹ️  这是首次设置，之后修改不会重复要求确认。");
+  }
+  for (const w of a.warnings || []) console.log(`⚠️  ${w}`);
+  console.log("提醒只提示，不代下单；是否真正弹窗提醒取决于你所用日历/宿主应用。");
+}
 
 async function main() {
   const out = {
@@ -385,6 +605,13 @@ async function main() {
 
   // ── 6. 分餐次吃饭提醒 + 活动日 → 日程 ─────────────────
   // 每个餐次单独成项并带 slot，保证同日早餐/晚餐 UID 不同（需求说明书 §8）
+  //
+  // §8.1：日程只生成「按提醒设置应当提醒」的餐次。
+  //   已保存的提醒设置（~/.maimen/reminders.json）优先于命令行 --slots；
+  //   未做任何设置时，按命令行 --slots（默认 lunch）生成，保持向后兼容。
+  const remStore = loadReminders();
+  const hasReminderConfig = remStore.configured && Object.keys(remStore.slots || {}).length > 0;
+  const reminderSkipped = [];
   for (let i = 0; i < settings.days; i++) {
     const d = addDays(today, i);
     const dayScore = scored ? scored.all.find((x) => x.date === d) : null;
@@ -394,10 +621,23 @@ async function main() {
     const weatherNote = i === 0 && out.weather ? `${out.weather.tempC}°C ${out.weather.weather || ""}` : "";
     for (const slot of settings.slots) {
       const def = SLOT_DEFS[slot];
+      // 已保存提醒设置时，按 shouldRemind 过滤（未开启 / 暂停 / 跳过 / 周末 / 延后）
+      if (hasReminderConfig) {
+        const gate = shouldRemind(remStore, slot, d);
+        if (!gate.remind) {
+          if (!reminderSkipped.some((x) => x.slot === slot && x.reason === gate.reason)) {
+            reminderSkipped.push({ slot, date: d, reason: gate.reason });
+          }
+          continue;
+        }
+      }
       const showPick = slot === "lunch" || settings.slots.length === 1;
+      const savedTime = hasReminderConfig && remStore.slots[slot] && remStore.slots[slot].time
+        ? remStore.slots[slot].time
+        : null;
       out.schedule.push({
         date: d,
-        time: remindTimeOf(slot),
+        time: savedTime || remindTimeOf(slot),
         kind: "meal",
         slot,
         title: `${def.emoji} 麦门${def.label}时间${strength}`,
@@ -416,6 +656,30 @@ async function main() {
         alarmMinutes: 15,
       });
     }
+  }
+  if (reminderSkipped.length) {
+    const uniq = [...new Map(reminderSkipped.map((x) => [`${x.slot}|${x.reason}`, x])).values()];
+    for (const x of uniq) {
+      out.warnings.push(`提醒设置：${x.slot} 未生成日程（${x.reason}）`);
+    }
+  }
+  if (hasReminderConfig && remStore.paused) {
+    out.warnings.push(
+      `提醒设置：当前处于暂停状态（${remStore.paused.from || "即刻"} → ${remStore.paused.to || "未定"}）`
+    );
+  }
+  out.reminder = {
+    configured: hasReminderConfig,
+    source: hasReminderConfig ? "已保存设置（~/.maimen/reminders.json）" : "命令行 --slots（未做持久设置）",
+    weekdayOnly: hasReminderConfig
+      ? Object.values(remStore.slots).some((c) => c.repeat === REPEAT_RULES.WEEKDAYS)
+      : false,
+    skipped: [...new Map(reminderSkipped.map((x) => [`${x.slot}|${x.reason}`, x])).values()],
+  };
+  if (out.reminder.weekdayOnly) {
+    out.warnings.push(
+      "「周一至周五」不等于法定工作日：调休与节假日需可靠日历来源或用户自定义，本工具不做假定。"
+    );
   }
 
   // 高力度活动日额外加事件。
@@ -443,10 +707,13 @@ async function main() {
   // 排序日程
   out.schedule.sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
 
-  // ── 6. 导出 .ics ─────────────────────────────────────
+  // ── 7. 导出 .ics ─────────────────────────────────────
+  // §8.3：同一 date+slot 的「用餐事件」与「活动信息」合并为单条；
+  //        不同餐次绝不合并；重复刷新不产生重复事件（靠稳定 UID）。
   if (args.ics) {
     const priority = { campaign: 0, meal: 1, training: 2 };
-    const ordered = [...out.schedule].sort(
+    const merged = mergeSchedule(out.schedule);
+    const ordered = [...merged].sort(
       (a, b) =>
         a.date.localeCompare(b.date) ||
         (priority[a.kind] ?? 9) - (priority[b.kind] ?? 9) ||
@@ -455,6 +722,10 @@ async function main() {
     const ics = scheduleToIcs(ordered, { calendarName: "麦门日历 · 吃与练" });
     writeFileSync(args.ics, ics, "utf8");
     out.icsFile = args.ics;
+    out.icsEventCount = ordered.length;
+    out.icsMergedFrom = out.schedule.length;
+    // §8.2：交付时说明「可承诺 / 不可承诺」，不以文本承诺替代后台能力
+    out.delivery = deliveryNote(args.subscribe ? "subscription" : "ics");
   }
 
   // ── 输出 ─────────────────────────────────────────────
@@ -517,6 +788,19 @@ function printHuman(out, s, store) {
   if (out.nutrition.verdictNote) console.log(`   ${out.nutrition.verdictNote}`);
   console.log(line());
 
+  if (out.reminder) {
+    console.log(`⏰ 提醒设置：${out.reminder.source}`);
+    if (out.reminder.weekdayOnly) {
+      console.log("   ⚠️ 「周一至周五」≠ 法定工作日（调休/节假日需可靠来源或自定义）");
+    }
+    if (out.reminder.skipped.length) {
+      for (const x of out.reminder.skipped.slice(0, 4)) {
+        console.log(`   · ${x.slot} 未生成：${x.reason}`);
+      }
+    }
+    console.log(line());
+  }
+
   console.log(`🗓️  日程（${out.schedule.length} 项）`);
   for (const e of out.schedule.slice(0, 10)) {
     const icon = e.kind === "meal" ? "🍽️" : e.kind === "training" ? "🏃" : "🎉";
@@ -525,7 +809,18 @@ function printHuman(out, s, store) {
   if (out.schedule.length > 10) console.log(`   …还有 ${out.schedule.length - 10} 项`);
   console.log(line());
 
-  if (out.icsFile) console.log(`✅ 已导出日历：${out.icsFile}（双击导入苹果/谷歌/Outlook 日历）`);
+  if (out.icsFile) {
+    console.log(`✅ 已导出日历：${out.icsFile}（双击导入苹果/谷歌/Outlook 日历）`);
+    if (out.icsMergedFrom != null && out.icsMergedFrom !== out.icsEventCount) {
+      console.log(`   · 已合并同日同餐次事件：${out.icsMergedFrom} → ${out.icsEventCount} 条`);
+    }
+    if (out.delivery) {
+      console.log(`   · 交付方式：${out.delivery.label}`);
+      console.log(`   · 可承诺：${out.delivery.canPromise.join("；")}`);
+      console.log(`   · 不可承诺：${out.delivery.cannotPromise.join("；")}`);
+      console.log(`   · ${out.delivery.note}`);
+    }
+  }
   for (const w of out.warnings) console.log(`⚠️  ${w}`);
   console.log("非官方应用 · 只提醒不下单 · 力度评分为估算 · 热量以麦当劳官方营养表为准");
 }

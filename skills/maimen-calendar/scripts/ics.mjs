@@ -79,16 +79,20 @@ export function fmtUtc(date) {
  * @param {boolean}[ev.allDay]
  * @param {number} [ev.sequence]     修订号，更新同一 UID 事件时递增（默认 0）
  * @param {Date}   [ev.lastModified] 最后修改时间（默认取当前时刻）
+ * @param {string} [ev.status]       事件状态：CONFIRMED（默认）/ CANCELLED（取消）
  */
 export function vevent(ev) {
   const minutes = ev.minutes || 30;
   const end = new Date(ev.start.getTime() + minutes * 60000);
+  const cancelled = String(ev.status || "").toUpperCase() === "CANCELLED";
   const lines = ["BEGIN:VEVENT"];
   lines.push(`UID:${ev.uid}`);
   // 更新已存在事件时保留 UID，并靠 SEQUENCE 递增 + LAST-MODIFIED 让客户端识别为「修订」
   lines.push(`SEQUENCE:${Number.isFinite(ev.sequence) ? ev.sequence : 0}`);
   lines.push(`DTSTAMP:${fmtUtc(new Date())}`);
   lines.push(`LAST-MODIFIED:${fmtUtc(ev.lastModified || new Date())}`);
+  // 取消事件有明确状态（§8.3）
+  lines.push(`STATUS:${cancelled ? "CANCELLED" : "CONFIRMED"}`);
   if (ev.allDay) {
     lines.push(`DTSTART;VALUE=DATE:${fmtLocal(ev.start).slice(0, 8)}`);
   } else {
@@ -99,7 +103,8 @@ export function vevent(ev) {
   if (ev.description) lines.push(`DESCRIPTION:${escapeText(ev.description)}`);
   if (ev.location) lines.push(`LOCATION:${escapeText(ev.location)}`);
   lines.push("TRANSP:OPAQUE");
-  if (ev.alarmMinutes != null) {
+  // 已取消事件不再带提醒
+  if (ev.alarmMinutes != null && !cancelled) {
     lines.push("BEGIN:VALARM");
     lines.push(`TRIGGER:-PT${ev.alarmMinutes}M`);
     lines.push("ACTION:DISPLAY");
@@ -221,4 +226,102 @@ export function toEvent(item) {
 export function scheduleToIcs(schedule, meta = {}) {
   const events = schedule.map((s) => toEvent(s));
   return buildIcs(events, meta);
+}
+
+/**
+ * 合并同一餐次的「用餐事件」与「适用活动信息」为单条事件（§8.3）。
+ *
+ * 规则：
+ *   - 同一 date + slot 的重复项按 date+slot 去重（重复刷新不产生重复事件）
+ *   - 同日活动信息并入当天**第一个用餐事件**（默认午饭）的 description，不再单独建事件
+ *   - **不同餐次绝不合并**（同日早餐与晚餐保持两条）
+ *   - 顺序无关：活动出现在用餐事件之前或之后都能正确并入
+ *
+ * @param {Array} schedule
+ * @returns {Array} 合并后的日程
+ */
+export function mergeSchedule(schedule = []) {
+  const byKey = new Map();
+  const order = [];
+
+  for (const item of schedule) {
+    // 同一餐次（或同类事项）以 date+slot 为键去重
+    const mergeKey = item.kind === "campaign" ? `${item.date}|campaign` : `${item.date}|${item.slot || item.kind}`;
+
+    if (!byKey.has(mergeKey)) {
+      byKey.set(mergeKey, { ...item });
+      order.push(mergeKey);
+    } else {
+      // 已存在同键：合并描述，不重复建事件
+      const cur = byKey.get(mergeKey);
+      if (item.desc && !String(cur.desc || "").includes(item.desc)) {
+        cur.desc = [cur.desc, item.desc].filter(Boolean).join("\n");
+      }
+    }
+  }
+
+  // 先收集全部用餐事件（按日期分组），再把活动信息并入
+  const out = [];
+  const campaigns = [];
+  for (const key of order) {
+    const item = byKey.get(key);
+    if (item.kind === "campaign") {
+      campaigns.push(item);
+      continue;
+    }
+    out.push(item);
+  }
+
+  for (const item of campaigns) {
+    // 并入当天第一个用餐事件（按输出顺序，通常是午饭）
+    const target = out.find((x) => x.date === item.date && x.kind === "meal");
+    if (target) {
+      const line = `活动：${item.title}`;
+      if (!String(target.desc || "").includes(line)) {
+        target.desc = [target.desc, line].filter(Boolean).join("\n");
+      }
+      continue; // 不再单独建活动事件
+    }
+    // 当天没有用餐事件（例如该餐次被提醒设置关闭）→ 保留独立活动事件
+    out.push(item);
+  }
+  return out;
+}
+
+/**
+ * 三种交付状态的可承诺 / 不可承诺说明（§8.2）。
+ * 交付时必须简短说明，不以文本承诺替代后台能力。
+ */
+export const DELIVERY_NOTES = Object.freeze({
+  ics: {
+    label: "ICS 文件",
+    canPromise: ["文件已生成，包含事件与提醒设置"],
+    cannotPromise: ["已添加进你的日历", "一定会弹窗提醒"],
+    note: "导入后是否弹窗、何时弹窗取决于你的日历客户端设置。",
+  },
+  subscription: {
+    label: "日历订阅",
+    canPromise: ["订阅地址可用，内容可更新"],
+    cannotPromise: ["所有客户端实时刷新", "秒级撤销"],
+    note: "刷新周期由客户端决定；本机地址仅对能访问该机器的客户端有效。",
+  },
+  hostSchedule: {
+    label: "宿主调度工具",
+    canPromise: ["工具确认已创建定时任务"],
+    cannotPromise: ["不具备后台能力时关闭应用也会运行"],
+    note: "是否在应用关闭后仍触发，取决于宿主是否提供后台调度能力。",
+  },
+});
+
+/** 生成交付说明文本。 */
+export function deliveryNote(mode) {
+  const d = DELIVERY_NOTES[mode];
+  if (!d) return null;
+  return {
+    mode,
+    label: d.label,
+    canPromise: d.canPromise,
+    cannotPromise: d.cannotPromise,
+    note: d.note,
+  };
 }

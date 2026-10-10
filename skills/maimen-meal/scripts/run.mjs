@@ -22,7 +22,26 @@ import {
   itemsForCandidate,
   comparePrices,
 } from "./mcp.mjs";
-import { loadMemory, saveMemory, recordSelection, memoryForRecommend } from "./memory.mjs";
+import {
+  loadMemory,
+  saveMemory,
+  appendEvent,
+  makeEvent,
+  deterministicId,
+  listEvents,
+  revokeFeedback,
+  clearMemory,
+  exportMemory,
+  purgeExpired,
+  memoryForRecommend,
+  trendReport,
+  updateConfirmed,
+  recordInferred,
+  EVENT_TYPES,
+  FEEDBACK_VERDICTS,
+  DEFAULT_RETENTION_DAYS,
+  DEFAULT_WINDOW_DAYS,
+} from "./memory.mjs";
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -73,20 +92,249 @@ if (args.help || args.h) {
   --demo                   强制使用演示数据（即使有 Token）
   --zodiacs                列出支持的星座
 
+记忆管理（需求说明书 §7）：
+  --record consumed        记「已吃过」（也能用 --record selected / rerolled / skipped）
+  --record-id <id>         配合 --record 指定餐品 id（默认取上次推荐）
+  --feedback <verdict>     记反馈：like | dislike | too_spicy | too_expensive
+  --feedback-id <id>       配合 --feedback 指定餐品 id（默认取上次推荐）
+  --view                   查看最近的记忆事件
+  --view-type <type>       查看指定类型的事件
+  --revoke <id>            撤销该餐品的反馈
+  --confirm-dislike <id>   明确确认不喜欢（写入 confirmed，不被推断覆盖）
+  --confirm-allergy <词>   明确确认过敏原（跨餐次生效）
+  --confirm-ban <id>       明确全局忌口（任何餐次都排除）
+  --unconfirm <id|词>      取消以上某条明确确认
+  --export                 导出全部记忆为 JSON
+  --clear                  清空记忆（同时清除由历史派生的偏好）
+  --clear-keep-confirmed   清空事件但保留明确确认的忌口/过敏
+  --purge                  清理超过保留期的事件（默认 180 天）
+
+  ⚠️ 「明确确认」（confirmed）与「统计推断」是两回事：
+      确认过的忌口不会被推断结果覆盖，推断也**不会**升级成禁忌。
+
 环境变量：
   MCD_MCP_TOKEN            麦当劳 MCP Token（不填则用演示数据）
   MCD_MCP_URL              接入地址（默认 https://mcp.mcd.cn）
   MAIMEN_MEMORY_PATH       记忆文件路径（默认 ~/.maimen/memory.json）
+  MAIMEN_RETENTION_DAYS    原始事件保留天数（默认 180）
+  MAIMEN_WINDOW_DAYS       推荐读取窗口天数（默认 30）
 
 示例：
   node run.mjs --budget 25 --slot lunch --drink hot --no-spicy
-  node run.mjs --slot breakfast --purpose light-meal --json`);
+  node run.mjs --feedback like --feedback-id c
+  node run.mjs --record consumed --record-id c
+  node run.mjs --view --view-type feedback
+  node run.mjs --confirm-allergy 花生 --confirm-ban 冰淇淋
+  node run.mjs --unconfirm 冰淇淋`);
   process.exit(0);
 }
 
 if (args.zodiacs) {
   console.log(JSON.stringify(supportedZodiacs(), null, 2));
   process.exit(0);
+}
+
+// ── 记忆管理子命令（§7.2：查看 / 修改 / 撤销 / 导出 / 清空）──
+// 这些命令只操作记忆，不做推荐，执行后即退出。
+{
+  const memPathOverride = process.env.MAIMEN_MEMORY_PATH;
+  const retentionDays = Number(process.env.MAIMEN_RETENTION_DAYS) || DEFAULT_RETENTION_DAYS;
+
+  const recordType =
+    args.record === true ? null : args.record ? String(args.record) : null;
+  const feedbackVerdict =
+    args.feedback === true ? null : args.feedback ? String(args.feedback) : null;
+  const isMemoryCommand =
+    recordType || feedbackVerdict || args.view || args.revoke || args.export || args.clear || args["clear-keep-confirmed"] || args.purge ||
+    args["confirm-dislike"] || args["confirm-allergy"] || args["confirm-ban"] || args.unconfirm;
+
+  if (isMemoryCommand) {
+    const store = loadMemory();
+    // 便捷取值：默认取最近一次 selected 的 mealId
+    const lastSelected = () => {
+      const list = listEvents(store, { type: EVENT_TYPES.SELECTED, limit: 1 });
+      return list[0] || null;
+    };
+    const resolveMeal = (explicit) => {
+      if (explicit) return { id: String(explicit), name: null };
+      const last = lastSelected();
+      if (!last) {
+        console.error("未指定餐品 id，且没有可参考的上次推荐。请用 --record-id / --feedback-id 指定。");
+        process.exit(2);
+      }
+      return { id: String(last.mealId), name: last.name };
+    };
+
+    const results = [];
+
+    if (recordType) {
+      const valid = [
+        EVENT_TYPES.SELECTED,
+        EVENT_TYPES.CONSUMED,
+        EVENT_TYPES.REROLLED,
+        EVENT_TYPES.SKIPPED,
+      ];
+      if (!valid.includes(recordType)) {
+        fail(`--record 只接受 ${valid.join(" / ")}，收到 "${recordType}"`);
+      }
+      const meal = resolveMeal(args["record-id"]);
+      // 同一动作重复执行不重复写入：用确定性 id + 当天 + 餐次
+      const day = new Date().toISOString().slice(0, 10);
+      const ev = makeEvent({
+        type: recordType,
+        eventId: deterministicId(recordType, meal.id, day, args.slot || ""),
+        mealId: meal.id,
+        name: meal.name,
+        mealSlot: args.slot ? String(args.slot) : null,
+        mealPurpose: args.purpose ? String(args.purpose) : null,
+        sourceSnapshot: { source: "cli", status: "verified" },
+      });
+      const written = appendEvent(store, ev);
+      saveMemory(store);
+      results.push({ action: recordType, mealId: meal.id, written, path: memPathOverride || undefined });
+    }
+
+    if (feedbackVerdict) {
+      if (!FEEDBACK_VERDICTS.includes(feedbackVerdict)) {
+        fail(`--feedback 只接受 ${FEEDBACK_VERDICTS.join(" / ")}，收到 "${feedbackVerdict}"`);
+      }
+      const meal = resolveMeal(args["feedback-id"]);
+      const ev = makeEvent({
+        type: EVENT_TYPES.FEEDBACK,
+        eventId: deterministicId("feedback", meal.id, feedbackVerdict, Date.now().toString()),
+        mealId: meal.id,
+        name: meal.name,
+        verdict: feedbackVerdict,
+        sourceSnapshot: { source: "user", status: "verified" },
+      });
+      appendEvent(store, ev);
+      // dislike 同时进入用户明确确认偏好（不得被推断覆盖）
+      if (feedbackVerdict === "dislike") {
+        if (!store.confirmed.dislikes.includes(meal.id)) store.confirmed.dislikes.push(meal.id);
+      }
+      saveMemory(store);
+      results.push({ action: "feedback", mealId: meal.id, verdict: feedbackVerdict });
+    }
+
+    if (args.revoke) {
+      const n = revokeFeedback(store, String(args.revoke));
+      saveMemory(store);
+      results.push({ action: "revoke", mealId: String(args.revoke), removed: n });
+    }
+
+    // ── 明确确认偏好（preference_updated 事件，§7.2：不得被推断覆盖）──
+    if (args["confirm-dislike"] || args["confirm-allergy"] || args["confirm-ban"] || args.unconfirm) {
+      const take = (v) => (v === true || v == null ? null : String(v));
+      const adding = {
+        dislikes: take(args["confirm-dislike"]),
+        allergies: take(args["confirm-allergy"]),
+        globalBans: take(args["confirm-ban"]),
+      };
+      const removing = take(args.unconfirm);
+
+      const next = {
+        dislikes: [...(store.confirmed.dislikes || [])],
+        allergies: [...(store.confirmed.allergies || [])],
+        globalBans: [...(store.confirmed.globalBans || [])],
+      };
+      for (const [k, v] of Object.entries(adding)) {
+        if (v && !next[k].includes(v)) next[k].push(v);
+      }
+      if (removing) {
+        for (const k of Object.keys(next)) {
+          next[k] = next[k].filter((x) => String(x) !== removing);
+        }
+      }
+      updateConfirmed(store, next);
+      saveMemory(store);
+      results.push({
+        action: "preference_updated",
+        confirmed: next,
+        added: Object.fromEntries(Object.entries(adding).filter(([, v]) => v)),
+        removed: removing || undefined,
+      });
+    }
+
+    if (args.view) {
+      const type = args["view-type"] && args["view-type"] !== true ? String(args["view-type"]) : null;
+      const slot = args.view === true ? null : args.view && String(args.view) !== "true" ? String(args.view) : null;
+      const events = listEvents(store, { type, slot, limit: 50 });
+      const payload = {
+        memoryPath: memPathOverride || undefined,
+        schemaVersion: store.schemaVersion,
+        totalEvents: store.events.length,
+        confirmed: store.confirmed,
+        inferred: store.inferred,
+        trend: trendReport(store, { slot }),
+        events,
+      };
+      if (args.json) console.log(JSON.stringify(payload, null, 2));
+      else {
+        console.log(`📒 记忆（schema v${store.schemaVersion} · 共 ${store.events.length} 条事件）`);
+        console.log("─".repeat(52));
+        if (!events.length) console.log("（暂无匹配事件）");
+        for (const e of events) {
+          const extra = e.verdict ? ` [${e.verdict}]` : "";
+          console.log(`  ${e.at.slice(0, 16).replace("T", " ")}  ${e.type}${extra}  ${e.name || e.mealId || ""}${e.mealSlot ? " · " + e.mealSlot : ""}`);
+        }
+        if (store.confirmed.dislikes.length) {
+          console.log(`\n明确不喜欢（用户确认）：${store.confirmed.dislikes.join(", ")}`);
+        }
+        if (store.inferred.notes.length) {
+          console.log(`推断偏好（仅供参考，非禁忌）：${store.inferred.notes.length} 条`);
+        }
+        console.log("─".repeat(52));
+        console.log(payload.trend.note);
+      }
+      process.exit(0);
+    }
+
+    if (args.export) {
+      const text = exportMemory(store);
+      if (args.json) console.log(JSON.stringify({ exported: text }, null, 2));
+      else console.log(text);
+      process.exit(0);
+    }
+
+    if (args.purge) {
+      const n = purgeExpired(store, { retentionDays });
+      saveMemory(store);
+      console.log(`已清理 ${n} 条超过 ${retentionDays} 天的事件（保留期可用 MAIMEN_RETENTION_DAYS 配置）。`);
+      process.exit(0);
+    }
+
+    if (args.clear || args["clear-keep-confirmed"]) {
+      clearMemory(store, { keepConfirmed: Boolean(args["clear-keep-confirmed"]) });
+      saveMemory(store);
+      console.log(
+        args["clear-keep-confirmed"]
+          ? "已清空事件与推断偏好，保留你明确确认的忌口/过敏。"
+          : "已清空全部记忆（含由历史派生的偏好）。"
+      );
+      process.exit(0);
+    }
+
+    if (results.length && args.json) console.log(JSON.stringify(results, null, 2));
+    else if (results.length) {
+      for (const r of results) {
+        if (r.action === "preference_updated") {
+          const parts = [];
+          if (r.added.dislikes) parts.push(`不喜欢 ${r.added.dislikes}`);
+          if (r.added.allergies) parts.push(`过敏 ${r.added.allergies}`);
+          if (r.added.globalBans) parts.push(`全局忌口 ${r.added.globalBans}`);
+          if (r.removed) parts.push(`取消确认 ${r.removed}`);
+          console.log(`✅ 已更新明确偏好：${parts.join("、") || "无变化"}`);
+          console.log(`   不喜欢：${r.confirmed.dislikes.join(", ") || "（无）"}`);
+          console.log(`   过敏原：${r.confirmed.allergies.join(", ") || "（无）"}`);
+          console.log(`   全局忌口：${r.confirmed.globalBans.join(", ") || "（无）"}`);
+          console.log("   这些是你明确确认的，不会被统计推断覆盖。");
+        } else {
+          console.log(`✅ ${r.action}：${r.mealId}${r.verdict ? " → " + r.verdict : ""}${r.written === false ? "（已存在，未重复写入）" : ""}`);
+        }
+      }
+    }
+    process.exit(0);
+  }
 }
 
 // ── 参数校验 ─────────────────────────────────────────
@@ -129,12 +377,14 @@ async function main() {
   const preference = derivePreferences({ weather, birthday, explicitDrink: settings.drink });
   const budgetCents = Math.round(settings.budget * 100);
 
-  // ── 记忆（持久化读取）──────────────────────────────
+  // ── 记忆（持久化读取，事件流模型）────────────────────
   const useMemory = !args["no-memory"];
-  const mem = useMemory ? loadMemory() : { version: 1, selections: [], feedback: {} };
-  const { history, excluded, lastPick } = useMemory
-    ? memoryForRecommend(mem, { slot })
-    : { history: [], excluded: new Set(), lastPick: null };
+  const memStore = useMemory ? loadMemory() : null;
+  const windowDays = Number(process.env.MAIMEN_WINDOW_DAYS) || DEFAULT_WINDOW_DAYS;
+  const memView = useMemory
+    ? memoryForRecommend(memStore, { slot, windowDays })
+    : { history: [], excluded: new Set(), lastPick: null, crossSlotPenalty: [], view: null };
+  const { history, excluded, lastPick } = memView;
 
   // ── 数据源：真实 MCP 优先 ───────────────────────────
   // status: verified=真实核价可用 / demo=演示数据 / failed=服务失败 / no-solution=业务无解
@@ -235,17 +485,55 @@ async function main() {
   }
   const finalMeal = runResult.meal;
 
-  // ── 记录本次选择（持久化写入）──────────────────────
-  if (useMemory && finalMeal && dataStatus !== "failed") {
-    recordSelection(mem, {
-      slot,
-      purpose,
-      id: finalMeal.id,
-      name: finalMeal.name,
-      priceCents: finalMeal.price,
-      status: dataStatus,
-    });
-    saveMemory(mem);
+  // ── 记录事件（§7.1：recommendation_shown 与 selected）────
+  let writtenEvents = 0;
+  if (useMemory && dataStatus !== "failed") {
+    const day = new Date().toISOString().slice(0, 10);
+    // 展示事件：用于本轮去重与推荐统计
+    const shownIds = (runResult.meal ? [runResult.meal.id] : []).concat(
+      history.filter((h) => h.kind === "selected").map((h) => h.id)
+    );
+    if (finalMeal) {
+      if (
+        appendEvent(
+          memStore,
+          makeEvent({
+            type: EVENT_TYPES.RECOMMENDATION_SHOWN,
+            eventId: deterministicId("shown", finalMeal.id, day, slot),
+            mealId: finalMeal.id,
+            name: finalMeal.name,
+            mealSlot: slot,
+            mealPurpose: purpose,
+            priceCents: finalMeal.price,
+            storeCode: store ? store.storeCode : null,
+            sourceSnapshot: { source: priceComparison ? "mcp:calculate-price" : "static", status: priceComparison ? priceComparison.status : "demo" },
+            note: `候选 ${runResult.count} 套`,
+          })
+        )
+      )
+        writtenEvents++;
+      // 选择事件：CLI 一次性输出即为「用户接受默认建议」
+      // 注意：这是弱偏好证据，不代表购买或吃过（§7.1）
+      if (
+        appendEvent(
+          memStore,
+          makeEvent({
+            type: EVENT_TYPES.SELECTED,
+            eventId: deterministicId("selected", finalMeal.id, day, slot),
+            mealId: finalMeal.id,
+            name: finalMeal.name,
+            mealSlot: slot,
+            mealPurpose: purpose,
+            priceCents: finalMeal.price,
+            storeCode: store ? store.storeCode : null,
+            sourceSnapshot: { source: "maimen-meal", status: dataStatus },
+          })
+        )
+      )
+        writtenEvents++;
+    }
+    purgeExpired(memStore, { retentionDays: Number(process.env.MAIMEN_RETENTION_DAYS) || DEFAULT_RETENTION_DAYS });
+    saveMemory(memStore);
   }
 
   // 把核价结论融进理由（按对象标记来源，不写死文案）
@@ -270,7 +558,7 @@ async function main() {
       validFor: "单次询价，付款前请以官方渠道为准",
     },
     weather: { source: weather ? "参数传入" : "未提供", status: weather ? "verified" : "unknown", scope: "day" },
-    memory: { source: "本地记忆文件", status: useMemory && history.length ? "verified" : "unknown", scope: `slot=${slot}` },
+    memory: { source: "本地记忆文件（事件流）", status: useMemory && history.length ? "verified" : "unknown", scope: `slot=${slot};window=${windowDays}d`, validFor: "事件保留 180 天（可配）" },
   };
 
   const payload = {
@@ -317,9 +605,14 @@ async function main() {
     reasons: [...runResult.reasons, ...extraReasons],
     memory: {
       used: useMemory,
-      historyCount: history.length,
+      schemaVersion: useMemory && memStore ? memStore.schemaVersion : null,
+      eventCount: history.length,
       lastPick,
       excludedCount: excluded.size,
+      recentSameSlot: memView.view ? memView.view.recentSameSlot : [],
+      crossSlotCount: memView.crossSlotPenalty.length,
+      windowDays,
+      wroteEvents: writtenEvents,
     },
     reminder: finalMeal
       ? { note: "本工具只询价、不创建订单、不付款；请自行前往麦当劳官方渠道下单。" }

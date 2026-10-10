@@ -26,8 +26,8 @@ description: 麦门日历 · 预算内帮你选，价格帮你核，吃过帮你
 2. 取活动日历与门店券 → 算每日力度分
 3. 组装当日候选 → 预算内筛选（硬上限，不回退）
 4. 计算热量与训练消耗 → 有则给收支，缺则保留 unknown
-5. 按餐次生成提醒项 → 加活动日事件
-6. 导出 .ics 或启动订阅服务
+5. 按餐次生成提醒项（按已保存的提醒设置过滤）→ 加活动日事件
+6. 合并同日事件 → 导出 .ics 或启动订阅服务
 
 ## 硬约束（不可违背）
 
@@ -37,6 +37,18 @@ description: 麦门日历 · 预算内帮你选，价格帮你核，吃过帮你
 - **力度是估算**：不是官方优惠金额，输出必须注明
 - **UID 不含序号**：用稳定业务标识，见 `references/calendar-rules.md`
 - **数据来源可追溯**：说明来自「中国天气网」/「麦当劳 MCP」/「本地默认」
+- **不假称后台能力**：交付方式必须列明「可承诺 / 不可承诺」，见下方「交付状态」
+- **「周一至周五」≠ 法定工作日**：调休与节假日需可靠来源或用户自定义，本工具不做假定
+
+## 交付状态（§8.2）
+
+提醒交付时必须如实说明能力边界，**不以文本承诺替代后台能力**：
+
+| 交付方式 | 可承诺 | 不可承诺 |
+| --- | --- | --- |
+| ICS 文件 | 文件已生成，含事件与提醒设置 | 已添加进你的日历；一定会弹窗提醒 |
+| 日历订阅 | 订阅地址可用，内容可更新 | 所有客户端实时刷新；秒级撤销 |
+| 宿主调度工具 | 工具确认已创建定时任务 | 不具备后台能力时关闭应用也会运行 |
 
 ## 关键异常
 
@@ -46,6 +58,7 @@ description: 麦门日历 · 预算内帮你选，价格帮你核，吃过帮你
 | 预算内无正餐候选 | 明确返回无解，**不回退全菜单** |
 | 单餐热量缺失 | 保留 unknown，不按 0 算，不给全天结论 |
 | 同一餐次重复导出 | UID 不变 + SEQUENCE 递增，客户端识别为更新而非新增 |
+| 餐次被提醒设置关闭/暂停/跳过 | 该餐次不生成日程，并在输出中说明原因 |
 
 ## 输出规则
 
@@ -75,6 +88,13 @@ node cli.mjs --city 上海 --budget 40 --days 7 --ics ./maimen.ics
 # 三餐都提醒
 node cli.mjs --city 上海 --slots breakfast,lunch,dinner --days 7 --ics ./maimen.ics
 
+# 设置提醒（持久化到 ~/.maimen/reminders.json，各餐次独立开关）
+node cli.mjs --setup-reminders --slots breakfast,lunch --remind-lunch 11:45
+node cli.mjs --slot-config dinner --disable
+node cli.mjs --slot-config lunch --repeat weekdays
+node cli.mjs --pause --until 2026-10-07
+node cli.mjs --view-reminders
+
 # 加训练计划 + 热量目标
 node cli.mjs --city 北京 --budget 45 --training fatLoss --weight 58 --goal 1600
 
@@ -102,6 +122,18 @@ node test.mjs
 | `--ics` | 导出路径 | 无 |
 | `--json` / `--demo` | 输出 JSON / 强制离线 | 关 |
 
+### 提醒设置子命令
+
+| 参数 | 说明 |
+| --- | --- |
+| `--setup-reminders` | 首次设置（配 `--slots` / `--remind-<slot>`） |
+| `--view-reminders` | 查看当前设置 |
+| `--slot-config <餐次>` | 修改某餐次（`--enable` / `--disable` / `--slot-budget` / `--repeat` / `--repeat-days`） |
+| `--pause [--until <日期>]` | 暂停全天 |
+| `--resume` | 恢复 |
+| `--skip-day <日期> [--slot <餐次>]` | 跳过某天 |
+| `--snooze <餐次> [--minutes <N>]` | 延后本次（默认 30 分钟） |
+
 > ⚠️ `--training` 与 `--goal` 语义不同，不可混用；写错直接报错退出。
 
 ## 环境变量
@@ -110,6 +142,7 @@ node test.mjs
 | --- | --- | --- |
 | `MCD_MCP_TOKEN` | 麦当劳 MCP Token | 否（缺省降级，天气仍可用） |
 | `MCD_MCP_URL` | MCP 接入地址 | 否（默认 `https://mcp.mcd.cn`） |
+| `MAIMEN_REMINDERS_PATH` | 提醒设置文件路径 | 否（默认 `~/.maimen/reminders.json`） |
 
 > **Token 安全**：只通过环境变量注入，绝不写入源码、仓库、示例或日志。
 
@@ -131,7 +164,7 @@ node test.mjs
 
 ```bash
 cd scripts && node test.mjs
-# ✅ 通过 78/78
+# ✅ 通过 97/97
 ```
 
 ## 边界与免责
