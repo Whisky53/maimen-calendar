@@ -128,7 +128,7 @@
 
 ## 六、开发产物
 
-- **2 个 WorkBuddy Skill**：`maiming-calendar`（主）、`maiming-lunch`（比价）
+- **2 个 WorkBuddy Skill**：`maimen-calendar`（主）、`maimen-meal`（比价）
 - **8 个核心模块** + **71 项回归测试**（全部通过）
 - **3 份技术文档**：README / MCP_INTEGRATION / 本文件
 - **1 个真实联调验证脚本**：`verify-mcp.mjs`（只询价不下单）

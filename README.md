@@ -76,15 +76,15 @@ export MCD_MCP_TOKEN="你的Token"
 ### 跑起来
 ```sh
 # 麦门日历：吃 14 天的午饭提醒，导出 .ics
-cd skills/maiming-calendar/scripts
+cd skills/maimen-calendar/scripts
 MCD_MCP_TOKEN=xxx node cli.mjs \
   --city 上海 --days 14 --budget 35 \
-  --weight 70 --height 175 --age 28 --gender male --goal fatLoss \
+  --weight 70 --height 175 --age 28 --gender male --training fatLoss \
   --ics ./麦门日历.ics
 
-# 麦门午饭：今天中午吃什么（真实比价）
-cd skills/maiming-lunch/scripts
-MCD_MCP_TOKEN=xxx node run.mjs --budget 35 --city 上海
+# 麦门这一餐：今天这一餐吃什么（按餐次 + 真实比价）
+cd skills/maimen-meal/scripts
+MCD_MCP_TOKEN=xxx node run.mjs --budget 35 --city 上海 --slot lunch
 
 # 只做端到端联调自检（询价，不下单）
 MCD_MCP_TOKEN=xxx node verify-mcp.mjs
@@ -93,12 +93,12 @@ MCD_MCP_TOKEN=xxx node verify-mcp.mjs
 ### 跑测试
 ```sh
 # 麦门日历：71 项回归测试（离线，不需要 Token）
-cd skills/maiming-calendar/scripts && node test.mjs
+cd skills/maimen-calendar/scripts && node test.mjs
 ```
 
 ### 本地订阅服务
 ```sh
-cd skills/maiming-calendar/scripts
+cd skills/maimen-calendar/scripts
 MCD_MCP_TOKEN=xxx node serve.mjs --port 8787 --city 上海
 # 浏览器打开 http://127.0.0.1:8787 看首页
 # 日历订阅：webcal://127.0.0.1:8787/maimen.ics
@@ -167,22 +167,32 @@ maimen-calendar/
 ├── mcp-config.example.json      # MCP 配置示例（环境变量占位符）
 ├── .gitignore                   # 确保 Token 不入库
 └── skills/
-    ├── maiming-calendar/        # 主 Skill：活动力度 + 天气 + 热量 + 训练 + 日历
+    ├── shared/                  # 两个 Skill 共用：MCP 传输层 / 金额 / 来源状态
+    │   ├── mcp-client.mjs
+    │   ├── money.mjs
+    │   └── source-status.mjs
+    ├── maimen-calendar/         # 主 Skill：活动力度 + 天气 + 热量 + 训练 + 日历
     │   ├── SKILL.md
-    │   ├── references/data-sources.md
+    │   ├── references/
+    │   │   ├── calendar-rules.md
+    │   │   └── data-sources.md
     │   └── scripts/
     │       ├── cli.mjs          # 主入口
     │       ├── weather.mjs      # 中国天气网适配 + 温度分层
     │       ├── campaign.mjs     # 活动力度评分引擎
     │       ├── nutrition.mjs    # 热量 + 训练
     │       ├── ics.mjs          # RFC 5545 日历生成
-    │       ├── mcd.mjs          # 麦当劳 MCP 调用封装
+    │       ├── mcd.mjs          # 麦当劳 MCP 业务封装
     │       ├── serve.mjs        # 本地订阅服务
-    │       └── test.mjs         # 71 项回归测试
-    └── maiming-lunch/           # 配套 Skill：午饭推荐 + 真实比价
+    │       └── test.mjs         # 回归测试
+    └── maimen-meal/             # 配套 Skill：单餐推荐 + 真实比价
         ├── SKILL.md
-        ├── mcp-config.example.json
         ├── references/
+        │   ├── recommendation-rules.md
+        │   ├── mcd-tools.md
+        │   ├── memory-schema.md
+        │   ├── output-contract.md
+        │   └── acceptance.md
         └── scripts/
 ```
 

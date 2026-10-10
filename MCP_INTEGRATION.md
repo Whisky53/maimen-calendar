@@ -16,7 +16,7 @@
 | 服务端 | `mcd-mcp v1.0.0` |
 | 限流 | 600 次/分钟 |
 
-调用统一封装在 `skills/*/scripts/mcp.mjs`（lunch）与 `skills/maiming-calendar/scripts/mcd.mjs`（calendar），
+调用统一封装在 `skills/*/scripts/mcp.mjs`（lunch）与 `skills/maimen-calendar/scripts/mcd.mjs`（calendar），
 对外暴露语义化方法：
 
 ```js
@@ -58,7 +58,7 @@ export const mcd = {
 
 ## 三、核心调用流程
 
-### 流程 A：午饭推荐 + 真实比价（maiming-lunch）
+### 流程 A：午饭推荐 + 真实比价（maimen-meal）
 
 ```
 ① query-nearby-stores          → storeCode
@@ -83,7 +83,7 @@ await calculatePrice({
 // 返回 price / originalPrice / discount 单位是「分」
 ```
 
-### 流程 B：活动力度 + 日历规划（maiming-calendar）
+### 流程 B：活动力度 + 日历规划（maimen-calendar）
 
 ```
 ① campaign-calendar            → dailyList[]（当月活动日历）

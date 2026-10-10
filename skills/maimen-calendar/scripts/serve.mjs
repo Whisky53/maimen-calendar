@@ -63,7 +63,7 @@ function generateIcs() {
       try {
         const data = JSON.parse(stdout);
         const { scheduleToIcs } = await import("./ics.mjs");
-        const ics = scheduleToIcs(data.schedule || [], { calendarName: "麦门日历 · 麦门午饭与训练" });
+        const ics = scheduleToIcs(data.schedule || [], { calendarName: "麦门日历 · 吃与练" });
         resolve(ics);
       } catch (e) {
         reject(e);

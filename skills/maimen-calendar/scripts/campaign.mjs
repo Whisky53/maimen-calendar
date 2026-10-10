@@ -321,17 +321,24 @@ export function addDays(dateStr, n) {
 /**
  * 力度 → 推荐权重调整：大力日更值得推荐"贵的 / 新品"，平淡日回归性价比。
  */
+/**
+ * 活动力度 → 偏好倾向。
+ *
+ * 注意（需求说明书 §13.2）：**预算为硬上限，任何档位都不放大预算**。
+ * 活动力度只影响「同样预算内更偏向尝鲜/升级」这一排序倾向，不改变可选范围。
+ * @returns {{prefTrend:number, note:string}}
+ */
 export function levelToBias(level) {
   switch (level && level.key) {
     case "great":
-      return { prefTrend: 1.5, budgetRelax: 1.15, note: "活动力度大，可适当放开预算尝鲜" };
+      return { prefTrend: 1.5, note: "活动力度大，同样预算内可优先尝鲜款" };
     case "good":
-      return { prefTrend: 1.2, budgetRelax: 1.08, note: "有明确的低价活动，可考虑升级一档" };
+      return { prefTrend: 1.2, note: "有明确的低价活动，同预算内可优先活动款" };
     case "fair":
-      return { prefTrend: 1.0, budgetRelax: 1.0, note: "有点小优惠，按常规选即可" };
+      return { prefTrend: 1.0, note: "有点小优惠，按常规选即可" };
     case "mild":
-      return { prefTrend: 0.9, budgetRelax: 1.0, note: "活动平平，走性价比路线" };
+      return { prefTrend: 0.9, note: "活动平平，走性价比路线" };
     default:
-      return { prefTrend: 0.8, budgetRelax: 1.0, note: "基本没活动，吃常规款就好" };
+      return { prefTrend: 0.8, note: "基本没活动，吃常规款就好" };
   }
 }

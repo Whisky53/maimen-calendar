@@ -27,7 +27,7 @@ import {
   expandPlan,
   TRAINING_TEMPLATES,
 } from "./nutrition.mjs";
-import { buildIcs, escapeText, foldLine, scheduleToIcs } from "./ics.mjs";
+import { buildIcs, escapeText, foldLine, scheduleToIcs, toEvent, buildUid } from "./ics.mjs";
 import { assert } from "node:console";
 
 let pass = 0;
@@ -322,9 +322,11 @@ check("推荐 floor：低分日不塞进 TOP", () => {
   ok(!r.top.some((d) => d.eventCount === 0), "无活动日不应进 TOP");
 });
 
-check("力度 → 策略偏置", () => {
-  ok(levelToBias(levelOf(80)).budgetRelax > 1, "大力日应放宽预算");
-  eq(levelToBias(levelOf(10)).budgetRelax, 1, "平淡日不放宽");
+check("力度 → 策略偏置（预算永不放宽）", () => {
+  // 需求说明书 §13.2：预算为硬上限，任何活动力度都不得放大预算
+  ok(!("budgetRelax" in levelToBias(levelOf(80))), "偏置对象不应再有 budgetRelax 字段");
+  ok(levelToBias(levelOf(80)).prefTrend > 1, "大力日应提高尝鲜倾向（偏好权重，非预算）");
+  eq(levelToBias(levelOf(10)).prefTrend < 1, true, "平淡日应降低尝鲜倾向");
 });
 
 // ── 热量与训练 ───────────────────────────────────
@@ -453,6 +455,57 @@ check("scheduleToIcs：从日程生成", () => {
   ]);
   eq((ics.match(/BEGIN:VEVENT/g) || []).length, 2);
   ok(ics.includes("午饭") && ics.includes("跑步"), "标题应保留");
+});
+
+// ── UID 稳定性（需求说明书 §8 / AC-29、AC-34）──────
+check("UID 不含列表序号：重排后同一事件 UID 不变", () => {
+  const a = toEvent({ date: "2026-10-10", time: "11:30", kind: "meal", title: "午饭", slot: "lunch" });
+  // 模拟列表顺序变化后重新生成（旧的 idx 方案会得到不同 UID）
+  const b = toEvent({ date: "2026-10-10", time: "11:30", kind: "meal", title: "午饭", slot: "lunch" });
+  eq(a.uid, b.uid, "同一业务事件 UID 必须稳定");
+  ok(!/-\d+@/.test(a.uid.replace(/@.*/, "") + "@") || !/\b0\b/.test(a.uid), "UID 不应含列表序号");
+});
+
+check("UID 稳定标识构成：scope-planId-date-slot-type", () => {
+  const uid = buildUid({
+    userScope: "local",
+    planId: "default",
+    date: "2026-10-10",
+    slot: "lunch",
+    type: "meal",
+  });
+  eq(uid, "local-default-2026-10-10-lunch-meal@maimen.local");
+});
+
+check("同日早餐与晚餐 UID 不同（AC-34）", () => {
+  const b = toEvent({ date: "2026-10-10", time: "07:30", kind: "meal", title: "早餐", slot: "breakfast" });
+  const d = toEvent({ date: "2026-10-10", time: "18:30", kind: "meal", title: "晚餐", slot: "dinner" });
+  ok(b.uid !== d.uid, "同一天不同餐次必须能共存");
+});
+
+check("同一餐次的提醒与事件 UID 不同", () => {
+  const meal = toEvent({ date: "2026-10-10", kind: "meal", title: "午饭", slot: "lunch", type: "meal" });
+  const rem = buildUid({ date: "2026-10-10", slot: "lunch", type: "reminder" });
+  ok(meal.uid !== rem, "事件与提醒不得共用 UID");
+});
+
+check("UID 含非法字符时被净化", () => {
+  const uid = buildUid({ date: "2026-10-10", slot: "lunch 午餐/正餐", type: "meal" });
+  ok(!/[\s/]/.test(uid), "UID 不应含空格或斜杠");
+});
+
+check("VEVENT 含 SEQUENCE 与 LAST-MODIFIED（更新可识别）", () => {
+  const ics = buildIcs([
+    { uid: "u-seq", summary: "改过的午饭", start: new Date(2026, 9, 10, 12, 0), sequence: 2 },
+  ]);
+  ok(ics.includes("SEQUENCE:2"), "应输出 SEQUENCE");
+  ok(ics.includes("LAST-MODIFIED:"), "应输出 LAST-MODIFIED");
+  ok(ics.includes("DTSTAMP:"), "应输出 DTSTAMP");
+});
+
+check("PRODID 使用 maimen 前缀", () => {
+  const ics = buildIcs([{ uid: "u1", summary: "x", start: new Date(2026, 9, 10, 12, 0) }]);
+  ok(ics.includes("-//maimen-calendar//"), "PRODID 应为 maimen-calendar");
 });
 
 // ── 结果 ─────────────────────────────────────────

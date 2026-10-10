@@ -66,17 +66,30 @@ export function tdee(profile = {}) {
  * @param {number} opts.targetKcal    目标摄入（如 TDEE 或预算）
  * @param {object} [opts.meal]        餐品营养明细
  */
-export function balance({ intakeKcal = 0, burnKcal = 0, targetKcal = null, meal = null }) {
-  const net = intakeKcal - burnKcal;
+export function balance({ intakeKcal = null, burnKcal = 0, targetKcal = null, meal = null }) {
   const out = {
     intakeKcal,
     burnKcal,
-    netKcal: net,
+    netKcal: null,
     targetKcal,
     meal,
     verdictNote: "",
     verdict: "unknown",
   };
+
+  // 摄入热量未知 → 保留 unknown，不出净摄入、不给全天收支结论
+  // （需求说明书 §13.2：不得把缺失热量按零参与全天计算）
+  if (intakeKcal === null || intakeKcal === undefined || !Number.isFinite(intakeKcal)) {
+    out.verdict = "unknown";
+    out.verdictNote = "摄入热量未知，本次不给全天收支结论。";
+    if (Number.isFinite(burnKcal) && burnKcal > 0) {
+      out.verdictNote += ` 已知今日训练消耗约 ${burnKcal} kcal。`;
+    }
+    return out;
+  }
+
+  const net = intakeKcal - burnKcal;
+  out.netKcal = net;
 
   if (targetKcal) {
     const remain = targetKcal - net;

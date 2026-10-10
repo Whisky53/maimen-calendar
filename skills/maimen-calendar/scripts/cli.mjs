@@ -63,11 +63,16 @@ if (args.help || args.h) {
   --height <cm>         身高（默认 168）
   --age <岁>            年龄（默认 30）
   --gender <male|female> 性别（默认 female）
-  --goal <kcal>         每日热量目标（默认按 TDEE 估算）
-  --remind <HH:MM>      吃饭提醒时间（默认 11:30）
+  --goal <kcal>         每日热量目标（数值，默认按 TDEE 估算）
+  --slots <列表>        要提醒的餐次，逗号分隔：breakfast,lunch,dinner,late-night（默认 lunch）
+  --remind <HH:MM>      指定餐次的提醒时间（仅当 --slots 只有一个时有效；
+                        多餐次请用 --remind-breakfast / --remind-lunch / --remind-dinner）
   --ics <文件路径>       导出 .ics 日历文件
   --json                输出 JSON
   --demo                强制离线演示（不调 MCP/天气网）
+
+注意：--training 只接受模板名（fatLoss/muscle/maintain），--goal 只接受数值 kcal。
+      两者语义不同，不可混用；写错会直接报错退出，不会静默忽略。
 
 示例：
   node cli.mjs --city 上海 --budget 40 --days 7 --ics ./maimen.ics
@@ -75,12 +80,82 @@ if (args.help || args.h) {
   process.exit(0);
 }
 
+// ── 参数校验（--training 与 --goal 语义分离，写错即报错）──
+function fail(msg) {
+  console.error(`参数错误：${msg}\n用 --help 查看用法。`);
+  process.exit(2);
+}
+
+const TRAINING_TEMPLATES_KEYS = ["fatLoss", "muscle", "maintain"];
+if (args.training != null) {
+  if (args.training === true) fail("--training 需要一个模板名");
+  if (!TRAINING_TEMPLATES_KEYS.includes(String(args.training))) {
+    fail(`--training 只接受 ${TRAINING_TEMPLATES_KEYS.join(" / ")}，收到 "${args.training}"`);
+  }
+}
+if (args.goal != null) {
+  if (args.goal === true) fail("--goal 需要一个数值（kcal）");
+  const g = Number(args.goal);
+  if (!Number.isFinite(g) || g <= 0) fail(`--goal 需要正数 kcal，收到 "${args.goal}"`);
+}
+for (const [k, min, max] of [
+  ["budget", 1, 200],
+  ["days", 1, 60],
+  ["weight", 20, 300],
+  ["height", 100, 250],
+  ["age", 10, 100],
+]) {
+  if (args[k] == null) continue;
+  const n = Number(args[k]);
+  if (!Number.isFinite(n) || n < min || n > max) fail(`--${k} 应在 ${min}–${max} 之间，收到 "${args[k]}"`);
+}
+if (args.remind != null && !/^\d{1,2}:\d{2}$/.test(String(args.remind))) {
+  fail(`--remind 需形如 HH:MM，收到 "${args.remind}"`);
+}
+
+// 餐次定义（需求说明书 §5）：默认午餐；每个餐次有各自的默认提醒时间
+const SLOT_DEFS = {
+  breakfast: { label: "早餐", time: "07:30", emoji: "🌅" },
+  lunch: { label: "午餐", time: "11:30", emoji: "🍟" },
+  dinner: { label: "晚餐", time: "18:30", emoji: "🌙" },
+  "late-night": { label: "夜宵", time: "22:00", emoji: "🌃" },
+  snack: { label: "加餐", time: "15:00", emoji: "🍪" },
+};
+
+const slots = (() => {
+  const raw = args.slots != null ? String(args.slots) : "lunch";
+  const list = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!list.length) fail("--slots 至少要有一个餐次");
+  for (const s of list) {
+    if (!SLOT_DEFS[s]) fail(`--slots 不支持 "${s}"，可选：${Object.keys(SLOT_DEFS).join(" / ")}`);
+  }
+  return [...new Set(list)];
+})();
+
+/** 取某餐次的提醒时间：优先 --remind-<slot>，其次单餐次时的 --remind，最后默认值。 */
+function remindTimeOf(slot) {
+  const perSlot = args[`remind-${slot}`];
+  if (perSlot != null && /^\d{1,2}:\d{2}$/.test(String(perSlot))) return String(perSlot);
+  if (slots.length === 1 && args.remind != null && /^\d{1,2}:\d{2}$/.test(String(args.remind))) {
+    return String(args.remind);
+  }
+  return SLOT_DEFS[slot].time;
+}
+for (const s of slots) {
+  const t = args[`remind-${s}`];
+  if (t != null && !/^\d{1,2}:\d{2}$/.test(String(t))) fail(`--remind-${s} 需形如 HH:MM，收到 "${t}"`);
+}
+
 const settings = {
   city: args.city || "上海",
   budget: args.budget ? Number(args.budget) : 35,
   days: args.days ? Number(args.days) : 7,
   store: args.store ? String(args.store) : null,
-  remind: args.remind || "11:30",
+  slots,
+  remind: args.remind || SLOT_DEFS[slots[0]].time,
   demo: Boolean(args.demo),
 };
 
@@ -233,7 +308,11 @@ async function main() {
   // ── 4. 预算内套餐 + 热量（结合今日力度与训练量） ───────
   const todayLevel = (scored && scored.today && scored.today.level) || null;
   const bias = levelToBias(todayLevel);
-  out.budget = { limitYuan: settings.budget, bias: bias.note };
+  out.budget = {
+    limitYuan: settings.budget,
+    hardLimit: true, // 预算为硬上限，任何活动力度都不放宽
+    bias: bias.note,
+  };
 
   if (menu) {
     try {
@@ -242,8 +321,19 @@ async function main() {
       // 否则会推荐出"圆筒冰淇淋 ¥5 · 93kcal"这种看似最优、实则荒谬的结果。
       const mealsOnly = norm.filter((m) => isMealWorthy(m.name));
       const inBudget = mealsOnly.filter((m) => m.priceCents <= settings.budget * 100);
-      const pool = (inBudget.length >= 3 ? inBudget : norm.filter((m) => m.priceCents <= settings.budget * 100))
-        .sort((a, b) => a.priceCents - b.priceCents);
+      // 预算为硬上限：正餐候选不足时也不放宽到「非正餐」或「超预算」，
+      // 有多少合格就用多少；为空则明确返回无解（不回退全菜单）。
+      const pool = inBudget.sort((a, b) => a.priceCents - b.priceCents);
+      if (pool.length === 0) {
+        out.budget.noSolution = true;
+        out.budget.reason =
+          mealsOnly.length === 0
+            ? "该门店菜单里没有可作正餐的候选（可能未取到菜单）"
+            : `预算 ${settings.budget} 元内没有可作正餐的候选（最低正餐 ${MONEY(
+                Math.min(...mealsOnly.map((m) => m.priceCents))
+              )}）`;
+        out.warnings.push(`预算内无解：${out.budget.reason}`);
+      }
       const picks = pool.slice(0, 14).map((c) => {
         const nut = kcalMap ? lookupKcal(kcalMap, c.name) : null;
         // 训练日适当抬高一餐能量下限（练了要补）
@@ -268,42 +358,64 @@ async function main() {
   }
 
   // ── 5. 热量收支 ──────────────────────────────────────
-  const intakeKcal = out.budget.recommended && out.budget.recommended.kcal ? out.budget.recommended.kcal : null;
+  // 摄入热量未知时保留 null（不得按 0 参与计算），并明确告知「无法给出全天结论」
+  const intakeKcal =
+    out.budget.recommended && Number.isFinite(out.budget.recommended.kcal)
+      ? out.budget.recommended.kcal
+      : null;
   const target = goalKcal || estimateTdee(profile);
+  const intakeSource = intakeKcal === null ? "unknown" : "estimated";
+  const bal = balance({
+    intakeKcal,
+    burnKcal: todayBurn,
+    targetKcal: target,
+  });
   out.nutrition = {
     profile,
     estimatedGoalKcal: target,
+    intakeKcal,
+    intakeSource,
     note: goalKcal ? "使用你指定的热量目标" : "按 Mifflin-St Jeor + 轻度活动估算，仅供参照",
-    ...balance({
-      intakeKcal: intakeKcal || 0,
-      burnKcal: todayBurn,
-      targetKcal: target,
-    }),
+    ...bal,
   };
+  if (intakeKcal === null) {
+    out.nutrition.note += "；本次未取得所选餐品的热量，全天收支结论不可给出";
+    out.warnings.push("所选餐品缺少热量数据，已按 unknown 处理，不参与全天收支计算");
+  }
 
-  // ── 5. 吃饭提醒 + 活动日 → 日程 ───────────────────────
+  // ── 6. 分餐次吃饭提醒 + 活动日 → 日程 ─────────────────
+  // 每个餐次单独成项并带 slot，保证同日早餐/晚餐 UID 不同（需求说明书 §8）
   for (let i = 0; i < settings.days; i++) {
     const d = addDays(today, i);
     const dayScore = scored ? scored.all.find((x) => x.date === d) : null;
-    const strength = dayScore ? `（今日活动力度：${dayScore.level.emoji} ${dayScore.level.label} ${dayScore.score} 分）` : "";
-    const weatherNote = i === 0 ? `${out.weather.tempC}°C ${out.weather.weather || ""}` : "";
-    out.schedule.push({
-      date: d,
-      time: settings.remind,
-      kind: "meal",
-      title: `🍟 麦门午饭时间${strength}`,
-      desc: [
-        dayScore ? `活动：${dayScore.title}` : "",
-        dayScore ? `力度评分：${dayScore.score}/100（${dayScore.priceLabel}）` : "",
-        weatherNote ? `天气：${weatherNote}` : "",
-        i === 0 && out.budget.recommended ? `推荐：${out.budget.recommended.name} ${out.budget.recommended.price}` : "",
-        "提醒：请自行前往麦当劳官方渠道下单（本工具不代下单）。",
-      ]
-        .filter(Boolean)
-        .join("\n"),
-      minutes: 20,
-      alarmMinutes: 15,
-    });
+    const strength = dayScore
+      ? `（今日活动力度：${dayScore.level.emoji} ${dayScore.level.label} ${dayScore.score} 分）`
+      : "";
+    const weatherNote = i === 0 && out.weather ? `${out.weather.tempC}°C ${out.weather.weather || ""}` : "";
+    for (const slot of settings.slots) {
+      const def = SLOT_DEFS[slot];
+      const showPick = slot === "lunch" || settings.slots.length === 1;
+      out.schedule.push({
+        date: d,
+        time: remindTimeOf(slot),
+        kind: "meal",
+        slot,
+        title: `${def.emoji} 麦门${def.label}时间${strength}`,
+        desc: [
+          dayScore ? `活动：${dayScore.title}` : "",
+          dayScore ? `力度评分：${dayScore.score}/100（${dayScore.priceLabel}）` : "",
+          weatherNote ? `天气：${weatherNote}` : "",
+          i === 0 && showPick && out.budget.recommended
+            ? `推荐：${out.budget.recommended.name} ${out.budget.recommended.price}`
+            : "",
+          "提醒：请自行前往麦当劳官方渠道下单（本工具不代下单）。",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        minutes: 20,
+        alarmMinutes: 15,
+      });
+    }
   }
 
   // 高力度活动日额外加事件。
@@ -318,6 +430,7 @@ async function main() {
           date: d.date,
           time: "10:00",
           kind: "campaign",
+          slot: "campaign",
           title: `${d.level.emoji} 麦当劳活动：${d.title.slice(0, 24)}`,
           desc: [`力度：${d.score}/100（${d.level.label}）`, ...d.reasons.slice(0, 4)].join("\n"),
           minutes: 30,
@@ -339,7 +452,7 @@ async function main() {
         (priority[a.kind] ?? 9) - (priority[b.kind] ?? 9) ||
         a.time.localeCompare(b.time)
     );
-    const ics = scheduleToIcs(ordered, { calendarName: "麦门日历 · 麦门午饭与训练" });
+    const ics = scheduleToIcs(ordered, { calendarName: "麦门日历 · 吃与练" });
     writeFileSync(args.ics, ics, "utf8");
     out.icsFile = args.ics;
   }

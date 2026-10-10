@@ -1,141 +1,26 @@
 /**
- * 麦当劳 MCP 适配层（真实接口，已端到端联调通过）。
+ * 麦当劳 MCP 业务适配层（maimen-meal）。
  *
- * 协议：Streamable HTTP（JSON-RPC 2.0），接入地址 https://mcp.mcd.cn
- * 鉴权：Authorization: Bearer <MCP_TOKEN>
- * Token 来源：环境变量 MCD_MCP_TOKEN（绝不写入源码 / 仓库 / 日志）
+ * 传输层（callTool / 响应解包 / SSE 兼容）在 skills/shared/mcp-client.mjs，
+ * 本文件只负责「麦当劳业务语义」：工具封装、菜单归一化、候选组装、比价。
  *
  * 真实调用链（到店自取）：
  *   query-nearby-stores(city)  → 得 storeCode / beCode
  *   query-meals(storeCode)     → 得真实菜单 + 价格
  *   calculate-price(storeCode, items[{productCode,quantity}]) → 得应付金额（单位：分）
  *
- * ⚠️ 已实测确认的接口事实（勿凭猜测改动）：
- *   - items 的商品字段名是 productCode（不是 code），quantity 为整数
- *   - calculate-price 返回的 price / originalPrice / discount 单位是「分」
- *   - query-meals 返回 currentPrice / originalPrice 是「元」字符串
- *   - query-meals 返回结构：data.categories[] + data.meals{code: 详情}
- *   - 响应同时存在于 result.content[0].text 与 result.structuredContent
- *
- * 无 Token 时所有调用降级为 null，由上层回退到演示数据，保证本地可跑。
+ * 接口字段事实见 references/mcd-tools.md。无 Token 时调用返回 null，
+ * 上层据此标记 status=demo，绝不伪装成真实结果。
  */
 
-const MCP_URL = process.env.MCD_MCP_URL || "https://mcp.mcd.cn";
-const TOKEN = process.env.MCD_MCP_TOKEN || "";
+import { callTool, hasMcp, listTools } from "../../shared/mcp-client.mjs";
+import { yuanToCents } from "../../shared/money.mjs";
 
-/** 是否具备真实 MCP 能力。 */
-export function hasMcp() {
-  return Boolean(TOKEN);
-}
+export { callTool, hasMcp, listTools };
+export const TOKEN = process.env.MCD_MCP_TOKEN || "";
 
 /** 默认到店自取场景参数（真实接口必填）。 */
 export const STORE_CONTEXT = { beType: 1, orderType: 1 };
-
-let reqId = 0;
-
-/**
- * 调用一个 MCP tool，返回 structuredContent.data（无则回退解析 text）。
- * @param {string} name  tool 名，如 query-meals
- * @param {object} args  参数
- */
-export async function callTool(name, args = {}) {
-  if (!TOKEN) return null;
-  reqId += 1;
-  const body = {
-    jsonrpc: "2.0",
-    id: reqId,
-    method: "tools/call",
-    params: { name, arguments: args },
-  };
-  const res = await fetch(MCP_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json, text/event-stream",
-      Authorization: `Bearer ${TOKEN}`,
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    // 401 Token 失效 / 429 限流；错误信息中绝不回显 Token
-    throw new Error(`MCP ${name} 调用失败：HTTP ${res.status}`);
-  }
-  const text = await res.text();
-  return extractData(parseMcpText(text), name);
-}
-
-/** 兼容 application/json 与 text/event-stream 两种响应。 */
-function parseMcpText(text) {
-  const trimmed = text.trim();
-  if (!trimmed) return null;
-  if (trimmed.startsWith("{")) {
-    return unwrap(JSON.parse(trimmed));
-  }
-  // SSE：取最后一条 data:
-  const lines = trimmed.split(/\r?\n/).filter((l) => l.startsWith("data:"));
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const payload = lines[i].slice(5).trim();
-    if (!payload) continue;
-    try {
-      return unwrap(JSON.parse(payload));
-    } catch {
-      /* 继续找下一条 */
-    }
-  }
-  return null;
-}
-
-function unwrap(j) {
-  if (j.error) throw new Error(`MCP 错误：${j.error.message || JSON.stringify(j.error)}`);
-  const r = j.result;
-  if (!r) return null;
-  // 真实接口优先返回 structuredContent
-  if (r.structuredContent) return r.structuredContent;
-  if (Array.isArray(r.content)) {
-    const first = r.content.find((c) => c && c.type === "text");
-    if (first && typeof first.text === "string") {
-      try {
-        return JSON.parse(first.text);
-      } catch {
-        return first.text;
-      }
-    }
-  }
-  return r;
-}
-
-/**
- * 从 structuredContent 中抽出 data，并统一校验 success 字段。
- * 业务失败（success:false）会抛出带 code/message 的错误，便于上层降级。
- */
-function extractData(sc, name) {
-  if (!sc || typeof sc !== "object") return sc;
-  if (sc.success === false) {
-    throw new Error(`MCP ${name} 业务失败 ${sc.code || ""}：${sc.message || "未知错误"}`);
-  }
-  return "data" in sc ? sc.data : sc;
-}
-
-/** 列出可用工具（联调时验证权限用）。 */
-export async function listTools() {
-  return callMethod("tools/list", {});
-}
-
-async function callMethod(method, params) {
-  if (!TOKEN) return null;
-  reqId += 1;
-  const res = await fetch(MCP_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json, text/event-stream",
-      Authorization: `Bearer ${TOKEN}`,
-    },
-    body: JSON.stringify({ jsonrpc: "2.0", id: reqId, method, params }),
-  });
-  if (!res.ok) throw new Error(`MCP ${method} 失败：HTTP ${res.status}`);
-  return parseMcpText(await res.text());
-}
 
 // ---- 具体业务封装（对应麦当劳 MCP 官方 Tool，参数名已对齐真实接口）----
 
@@ -194,15 +79,19 @@ export function normalizeMenu(raw, { categoryHint = null } = {}) {
 
   const out = [];
   for (const [code, m] of byCode) {
-    const priceYuan = Number(m.currentPrice ?? m.price ?? 0) || 0;
-    const price = Math.round(priceYuan * 100); // 元 → 分，与 calculate-price 统一
+    // 价格缺失时保留 null（= unknown），绝不按 0 处理
+    const priceRaw = m.currentPrice ?? m.price ?? null;
+    const price = yuanToCents(priceRaw);
+    const origRaw = m.originalPrice ?? null;
+    const originalPrice = yuanToCents(origRaw);
     const category = codeCategory.get(code) || categoryHint || "其他";
     const name = m.name || m.productName || `餐品${code}`;
     out.push({
       code,
       name,
       price,
-      originalPrice: Math.round((Number(m.originalPrice) || priceYuan) * 100),
+      priceStatus: price === null ? "unknown" : "verified",
+      originalPrice,
       discountType: m.discountType || null,
       category,
       image: m.image || null,
@@ -266,28 +155,30 @@ export function comboCandidates(menu) {
 }
 
 /**
- * 为推荐引擎生成更合适的候选池：
- * 1) 优先取官方套餐（isCombo）——这是"一顿饭"的自然单元
- * 2) 若套餐不足，再用「硬主食 + 饮品」拼出少量合理搭配
+ * 为推荐引擎生成候选池。
  *
- * 关键：候选必须是"能当一顿午饭"的，不能把单杯牛奶/单包饼干/派当推荐。
+ * 选择顺序（不因数量少而放宽价格门槛——预算硬上限不可突破）：
+ *   1) 官方套餐（isCombo）中「价格已知且已知价 ≤ 预算」的部分
+ *   2) 若套餐不足，用「硬主食 + 饮品」拼出合理搭配补充
+ *   3) 补充后仍为空 → 返回 []，由上层返回「预算内无解」，绝不回退到全菜单
+ *
+ * 价格未知（null）的候选不参与预算内候选池，避免「先按标价筛、核价后又不一致」。
+ *
  * @param {Array} menu normalizeMenu 的产物
- * @param {number} budgetCents 预算（分）
+ * @param {number} budgetCents 预算（分）；Infinity 表示不限
+ * @returns {Array} 候选数组，可能为空
  */
 export function buildCandidates(menu, budgetCents = Infinity) {
-  // 官方套餐：名称含"套餐/三件套/盒/拼盘"等，且不是周边/酱/饼干
-  const combos = comboCandidates(menu).filter((m) => m.isCombo && m.price <= budgetCents);
+  const affordable = (m) =>
+    typeof m.price === "number" && Number.isFinite(m.price) && m.price <= budgetCents;
+
+  const combos = comboCandidates(menu).filter((m) => m.isCombo && affordable(m));
   if (combos.length >= 3) return combos;
 
-  // 兜底：真实"硬主食"（堡/鸡/卷/饭类）+ 最便宜饮品
+  // 补充：真实"硬主食"（堡/鸡/卷/饭类）+ 最便宜饮品
   const { mains, drinks } = splitMenu(menu);
-  const cheapDrinks = drinks
-    .filter((d) => d.price <= budgetCents)
-    .sort((a, b) => a.price - b.price);
-  const solidMains = mains
-    .filter((m) => m.price <= budgetCents)
-    .sort((a, b) => a.price - b.price)
-    .slice(0, 6);
+  const cheapDrinks = drinks.filter(affordable).sort((a, b) => a.price - b.price);
+  const solidMains = mains.filter(affordable).sort((a, b) => a.price - b.price).slice(0, 6);
   const built = [];
   for (const m of solidMains) {
     const d = cheapDrinks.find((x) => m.price + x.price <= budgetCents);
@@ -296,6 +187,8 @@ export function buildCandidates(menu, budgetCents = Infinity) {
       code: m.code,
       name: `${m.name} + ${d.name}`,
       price: m.price + d.price,
+      priceStatus: "verified",
+      originalPrice: (m.originalPrice ?? m.price) + (d.originalPrice ?? d.price),
       category: "搭配",
       isCombo: false,
       comboItems: [
@@ -308,6 +201,7 @@ export function buildCandidates(menu, budgetCents = Infinity) {
       main: m.name,
     });
   }
+  // 只返回合格集合；可能为空（上层据此返回无解），不回退全菜单
   return [...combos, ...built];
 }
 
@@ -321,26 +215,47 @@ export function itemsForCandidate(c) {
 }
 
 /**
- * 比价：对一组候选组合分别精算应付金额，返回最低价方案。
- * @param {Array<{items:Array, label?:string}>} candidates  items 为 [{productCode,quantity}]
- * @param {object} base  calculate-price 的公共参数（storeCode 等）
+ * 比价：对一组候选组合分别精算应付金额（单位：分）。
+ *
+ * 每个结果都带 status，便于上层按对象标记来源：
+ *   - verified：calculate-price 成功返回，payableCents 为整数分
+ *   - failed  ：该候选核价失败（网络/业务错误），payableCents 为 null，附 error
+ *   - skipped ：无 Token，未做核价，payableCents 为 null
+ *
+ * 失败候选保留在 all 里（不静默丢弃），最终推荐只从 verified 中选。
+ *
+ * @param {Array<{items:Array, label?:string}>} candidates items 为 [{productCode,quantity}]
+ * @param {object} base calculate-price 的公共参数（storeCode 等）
  */
 export async function comparePrices(candidates, base = {}) {
-  if (!TOKEN) return null;
+  if (!TOKEN) {
+    return {
+      best: null,
+      all: candidates.map((c) => ({ ...c, payableCents: null, status: "skipped" })),
+      status: "skipped",
+    };
+  }
   const results = [];
   for (const c of candidates) {
     try {
       const quote = await mcd.calculatePrice({ ...base, items: c.items });
-      if (!quote) continue;
+      if (!quote) {
+        results.push({ ...c, payableCents: null, status: "failed", error: "空响应" });
+        continue;
+      }
       // 真实接口：price 单位为分
-      const payableCents =
-        quote.price ?? quote.payableCents ?? quote.totalCents ?? null;
-      results.push({ ...c, quote, payableCents });
+      const payableCents = quote.price ?? quote.payableCents ?? quote.totalCents ?? null;
+      results.push({
+        ...c,
+        quote,
+        payableCents: typeof payableCents === "number" ? payableCents : null,
+        status: typeof payableCents === "number" ? "verified" : "failed",
+      });
     } catch (e) {
-      results.push({ ...c, error: e.message, payableCents: null });
+      results.push({ ...c, error: e.message, payableCents: null, status: "failed" });
     }
   }
-  const valid = results.filter((r) => typeof r.payableCents === "number");
+  const valid = results.filter((r) => r.status === "verified");
   valid.sort((a, b) => a.payableCents - b.payableCents);
-  return { best: valid[0] || null, all: results };
+  return { best: valid[0] || null, all: results, status: valid.length ? "verified" : "failed" };
 }

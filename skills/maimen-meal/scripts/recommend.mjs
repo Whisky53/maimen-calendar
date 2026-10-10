@@ -21,11 +21,44 @@ export const DEFAULT_SETTINGS = {
   drink: "any", // any | hot | cold
   noSpicy: false,
   city: "上海",
+  mealSlot: null, // breakfast | lunch | dinner | late-night | snack；null = 按当前时间推断
+  mealPurpose: "full-meal", // full-meal | light-meal | drink-only
 };
 
 /**
+ * 餐次定义（需求说明书 §5）：标签、默认时段、默认预算倾向。
+ * 时段只用于「未指定时按当前时间推断」，不作为硬约束。
+ */
+export const MEAL_SLOTS = {
+  breakfast: { label: "早餐", from: 5, to: 10, defaultPurpose: "light-meal" },
+  lunch: { label: "午餐", from: 10, to: 15, defaultPurpose: "full-meal" },
+  dinner: { label: "晚餐", from: 16, to: 22, defaultPurpose: "full-meal" },
+  "late-night": { label: "夜宵", from: 22, to: 26, defaultPurpose: "light-meal" },
+  snack: { label: "加餐", from: 14, to: 17, defaultPurpose: "light-meal" },
+};
+
+/** 用餐目的定义：决定候选池的「份量档位」。 */
+export const MEAL_PURPOSES = {
+  "full-meal": { label: "正餐", needMain: true, needDrink: false },
+  "light-meal": { label: "轻食", needMain: false, needDrink: false },
+  "drink-only": { label: "仅饮品", needMain: false, needDrink: true },
+};
+
+/**
+ * 按当前时间推断餐次。
+ * @param {Date} [now]
+ */
+export function inferSlot(now = new Date()) {
+  const h = now.getHours();
+  if (h >= 5 && h < 10) return "breakfast";
+  if (h >= 10 && h < 15) return "lunch";
+  if (h >= 15 && h < 17) return "snack";
+  if (h >= 17 && h < 22) return "dinner";
+  return "late-night";
+}
+
+/**
  * 归一化一份餐品（兼容真实 MCP 返回与演示数据）。
- * 真实 MCP 字段较杂，这里只取推荐所需的最小集。
  * @param {object} raw
  * @param {number} idx
  */
@@ -35,8 +68,8 @@ export function normalizeMeal(raw, idx) {
       ? raw.priceCents
       : typeof raw.price === "number"
         ? raw.price
-        : 0;
-  const text = `${raw.name || ""}${raw.main || ""}${raw.drink || ""}`;
+        : null; // 缺失保留 null，不按 0
+  const text = `${raw.name || ""}${raw.main || ""}${raw.drink || ""}${raw.side || ""}`;
   const temp =
     raw.temp ||
     (/冰|冷/.test(text) ? "cold" : /热|暖/.test(text) ? "hot" : "any");
@@ -49,7 +82,12 @@ export function normalizeMeal(raw, idx) {
     drink: raw.drink || "",
     temp,
     price,
+    priceStatus: raw.priceStatus || (price === null ? "unknown" : "verified"),
     spicy: typeof raw.spicy === "boolean" ? raw.spicy : /辣/.test(text),
+    // 是否含主食 / 是否含饮品，供用餐目的判定
+    hasMain: raw.main != null ? Boolean(raw.main) : /堡|卷|饭|鸡|牛|鱼|套餐|盒/.test(text),
+    hasDrink: Boolean(raw.drink) || /可乐|雪碧|红茶|咖啡|拿铁|美式|奶|汁|茶|水/.test(text),
+    isCombo: Boolean(raw.isCombo),
     sign: raw.sign || "",
     motto: raw.motto || "",
   };
@@ -75,27 +113,57 @@ export function summarizeHistory(history = []) {
 
 /**
  * 推荐主函数。
+ *
  * @param {object} opts
- * @param {object} opts.settings  预算/冷热/不吃辣
- * @param {Array}  opts.meals     候选餐品（真实或演示）
- * @param {Array}  opts.history   历史事件
- * @param {string} [opts.previous] 上一套（抽签避重复）
+ * @param {object} opts.settings     预算/冷热/不吃辣/餐次/用餐目的
+ * @param {Array}  opts.meals        候选餐品（真实或演示）
+ * @param {Array}  opts.history      历史事件（见 memory.mjs）
+ * @param {string} [opts.previous]   上一套（抽签避重复）
  * @param {object} [opts.preference] derivePreferences 的结果（可选）
+ * @param {Set<string>} [opts.excluded] 明确排除的 id
+ * @returns {{meal:object|null, count:number, reasons:string[], constraints:object,
+ *            slot:string, purpose:string, emptyReason:string|null}}
  */
-export function recommend({ settings, meals, history = [], previous, preference } = {}) {
+export function recommend({
+  settings,
+  meals,
+  history = [],
+  previous,
+  preference,
+  excluded = null,
+} = {}) {
   const s = { ...DEFAULT_SETTINGS, ...settings };
-  const pool = (meals && meals.length ? meals : DEMO_MEALS).map(normalizeMeal);
+  const slot = s.mealSlot || inferSlot();
+  const purpose = MEAL_PURPOSES[s.mealPurpose] ? s.mealPurpose : "full-meal";
+  const purposeDef = MEAL_PURPOSES[purpose];
+
+  const source = meals && meals.length ? meals : DEMO_MEALS;
+  const pool = source.map(normalizeMeal);
   const { latest, recent } = summarizeHistory(history);
   const budgetCents = Math.round(s.budget * 100);
 
-  // 1) 硬约束过滤
+  // 1) 硬约束过滤（预算为硬上限；目的不符者排除；价格未知不进入预算内比较）
   const eligible = pool.filter((m) => {
-    if (m.price > budgetCents) return false;
+    if (m.price === null || !Number.isFinite(m.price) || m.price > budgetCents) return false;
     if (s.noSpicy && m.spicy) return false;
     if (s.drink !== "any" && m.temp !== s.drink && m.temp !== "any") return false;
     if (latest.get(m.id) === "dislike") return false;
+    if (excluded && excluded.has(m.id)) return false;
+    if (purposeDef.needDrink && !m.hasDrink) return false;
     return true;
   });
+
+  // 无解原因分档，便于上层区分「业务无解」与「服务失败」
+  let emptyReason = null;
+  if (!eligible.length) {
+    const knownPrice = pool.filter((m) => m.price !== null);
+    if (!knownPrice.length) emptyReason = "所有候选价格未知，无法判定是否在预算内";
+    else if (!pool.some((m) => m.price !== null && m.price <= budgetCents))
+      emptyReason = `预算内没有候选（最低 ${Math.min(...knownPrice.map((m) => m.price)) / 100} 元）`;
+    else if (purposeDef.needDrink && !pool.some((m) => m.hasDrink))
+      emptyReason = "没有符合「仅饮品」的候选";
+    else emptyReason = "当前条件下没有可行方案";
+  }
 
   // 2) 软偏好打分
   const prefTemp = preference && preference.preferredTemp ? preference.preferredTemp : null;
@@ -119,6 +187,7 @@ export function recommend({ settings, meals, history = [], previous, preference 
   if (meal) {
     const left = budgetCents - meal.price;
     reasons.push(`预算内，还剩 ¥${(left / 100).toFixed(2)}`);
+    reasons.push(`餐次：${MEAL_SLOTS[slot] ? MEAL_SLOTS[slot].label : slot} · 目的：${purposeDef.label}`);
     if (s.drink === "hot") reasons.push("已按热饮偏好过滤");
     else if (s.drink === "cold") reasons.push("已按冷饮偏好过滤");
     if (s.noSpicy) reasons.push("已避开辣味餐品");
@@ -134,6 +203,16 @@ export function recommend({ settings, meals, history = [], previous, preference 
     meal,
     count: eligible.length,
     reasons,
-    constraints: { budget: s.budget, drink: s.drink, noSpicy: s.noSpicy },
+    slot,
+    purpose,
+    emptyReason,
+    constraints: {
+      budget: s.budget,
+      budgetHardLimit: true,
+      drink: s.drink,
+      noSpicy: s.noSpicy,
+      slot,
+      purpose,
+    },
   };
 }

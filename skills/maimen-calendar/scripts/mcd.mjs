@@ -1,94 +1,18 @@
 /**
- * 麦当劳 MCP 适配层（maiming-calendar 版）。
+ * 麦当劳 MCP 业务适配层（maimen-calendar）。
  *
- * 复用 maiming-lunch 已实测确认的接口事实：
- *   - items 商品字段名是 productCode（不是 code）
- *   - calculate-price 返回价格为「分」；query-meals 的 currentPrice 是「元」字符串
- *   - query-meals / calculate-price 必填 storeCode + beType + orderType（到店自取 1/1）
- *   - 优先取 result.structuredContent
+ * 传输层（callTool / 响应解包 / SSE 兼容）在 skills/shared/mcp-client.mjs，
+ * 本文件只负责日历侧业务：活动日历、优惠券、营养热量解析。
  *
- * 本模块比 maiming-lunch 多接：
- *   - campaign-calendar（活动日历）
- *   - query-store-coupons / available-coupons（优惠券）
- *   - list-nutrition-foods（营养热量，注意：返回的是紧凑文本表格，需专门解析）
- *
- * Token 只从环境变量 MCD_MCP_TOKEN 读取，绝不写入源码。
+ * 接口字段事实见 references/data-sources.md。无 Token 时调用返回 null，
+ * 上层据此标记 status=demo，绝不伪装成真实结果。
  */
 
-const MCP_URL = process.env.MCD_MCP_URL || "https://mcp.mcd.cn";
+import { callTool, hasMcp } from "../../shared/mcp-client.mjs";
+
+export { callTool, hasMcp };
 const TOKEN = process.env.MCD_MCP_TOKEN || "";
-
-export function hasMcp() {
-  return Boolean(TOKEN);
-}
-
 export const STORE_CONTEXT = { beType: 1, orderType: 1 };
-
-let reqId = 0;
-
-export async function callTool(name, args = {}) {
-  if (!TOKEN) return null;
-  reqId += 1;
-  const res = await fetch(MCP_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json, text/event-stream",
-      Authorization: `Bearer ${TOKEN}`,
-    },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: reqId,
-      method: "tools/call",
-      params: { name, arguments: args },
-    }),
-  });
-  if (!res.ok) throw new Error(`MCP ${name} 调用失败：HTTP ${res.status}`);
-  return extractData(parseMcpText(await res.text()), name);
-}
-
-function parseMcpText(text) {
-  const trimmed = (text || "").trim();
-  if (!trimmed) return null;
-  if (trimmed.startsWith("{")) return unwrap(JSON.parse(trimmed));
-  const lines = trimmed.split(/\r?\n/).filter((l) => l.startsWith("data:"));
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const payload = lines[i].slice(5).trim();
-    if (!payload) continue;
-    try {
-      return unwrap(JSON.parse(payload));
-    } catch {
-      /* 继续 */
-    }
-  }
-  return null;
-}
-
-function unwrap(j) {
-  if (j.error) throw new Error(`MCP 错误：${j.error.message || JSON.stringify(j.error)}`);
-  const r = j.result;
-  if (!r) return null;
-  if (r.structuredContent) return r.structuredContent;
-  if (Array.isArray(r.content)) {
-    const first = r.content.find((c) => c && c.type === "text");
-    if (first && typeof first.text === "string") {
-      try {
-        return JSON.parse(first.text);
-      } catch {
-        return first.text;
-      }
-    }
-  }
-  return r;
-}
-
-function extractData(sc, name) {
-  if (!sc || typeof sc !== "object") return sc;
-  if (sc.success === false) {
-    throw new Error(`MCP ${name} 业务失败 ${sc.code || ""}：${sc.message || "未知错误"}`);
-  }
-  return "data" in sc ? sc.data : sc;
-}
 
 // ---- 业务封装 ----
 

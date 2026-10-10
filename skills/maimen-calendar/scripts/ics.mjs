@@ -14,7 +14,9 @@
  */
 
 const CRLF = "\r\n";
-const PRODID = "-//maiming-calendar//麦门日历//CN";
+const PRODID = "-//maimen-calendar//麦门日历//CN";
+/** UID 域名后缀，保持稳定，便于客户端识别同一来源事件。 */
+const UID_DOMAIN = "maimen.local";
 
 /** 转义 iCalendar 文本值。 */
 export function escapeText(s) {
@@ -70,18 +72,23 @@ export function fmtUtc(date) {
  * @param {string} ev.uid
  * @param {string} ev.summary
  * @param {Date}   ev.start
- * @param {number} [ev.minutes]   时长（默认 30）
+ * @param {number} [ev.minutes]      时长（默认 30）
  * @param {string} [ev.description]
  * @param {string} [ev.location]
  * @param {number} [ev.alarmMinutes] 提前提醒分钟数
  * @param {boolean}[ev.allDay]
+ * @param {number} [ev.sequence]     修订号，更新同一 UID 事件时递增（默认 0）
+ * @param {Date}   [ev.lastModified] 最后修改时间（默认取当前时刻）
  */
 export function vevent(ev) {
   const minutes = ev.minutes || 30;
   const end = new Date(ev.start.getTime() + minutes * 60000);
   const lines = ["BEGIN:VEVENT"];
   lines.push(`UID:${ev.uid}`);
+  // 更新已存在事件时保留 UID，并靠 SEQUENCE 递增 + LAST-MODIFIED 让客户端识别为「修订」
+  lines.push(`SEQUENCE:${Number.isFinite(ev.sequence) ? ev.sequence : 0}`);
   lines.push(`DTSTAMP:${fmtUtc(new Date())}`);
+  lines.push(`LAST-MODIFIED:${fmtUtc(ev.lastModified || new Date())}`);
   if (ev.allDay) {
     lines.push(`DTSTART;VALUE=DATE:${fmtLocal(ev.start).slice(0, 8)}`);
   } else {
@@ -143,36 +150,75 @@ function timezoneBlock() {
 }
 
 /**
+ * 构造稳定 UID。
+ *
+ * 规则（需求说明书 §8）：`<userScope>-<planId>-<date>-<slot|instance>-<type>`
+ *   - 不使用列表序号、不使用标题 —— 否则重排后客户端会「新增一条」而不是「更新一条」
+ *   - 同一日早餐与晚餐 slot 不同 → UID 不同，可共存
+ *   - 同一餐次的提醒与事件本身 type 不同 → UID 不同
+ *
+ * @param {object} p
+ * @param {string} p.userScope  用户范围标识（如 "local" 或用户 id）
+ * @param {string} p.planId     计划标识（同一份日历计划内唯一）
+ * @param {string} p.date       YYYY-MM-DD
+ * @param {string} p.slot       餐次或实例标识：breakfast/lunch/dinner/late-night/snack/training
+ * @param {string} p.type       事件类型：meal | reminder | training | campaign
+ */
+export function buildUid({ userScope = "local", planId = "default", date, slot = "event", type = "meal" }) {
+  const safe = (s) => String(s == null ? "" : s).replace(/[^A-Za-z0-9-]/g, "-");
+  return `${safe(userScope)}-${safe(planId)}-${safe(date)}-${safe(slot)}-${safe(type)}@${UID_DOMAIN}`;
+}
+
+/**
  * 把日程项（吃饭提醒/训练/活动）翻译成 vevent 参数。
+ *
  * @param {object} item
- * @param {string} item.date   YYYY-MM-DD
- * @param {string} item.time   HH:MM
- * @param {string} item.kind   meal | training | campaign
+ * @param {string} item.date       YYYY-MM-DD
+ * @param {string} item.time       HH:MM
+ * @param {string} item.kind       meal | training | campaign
  * @param {string} item.title
  * @param {string} [item.desc]
+ * @param {string} [item.slot]     餐次：breakfast/lunch/dinner/late-night/snack；training 用 "training"
+ * @param {string} [item.uid]      显式指定的 UID（优先级最高）
+ * @param {string} [item.userScope] 用户范围，默认 "local"
+ * @param {string} [item.planId]   计划标识，默认 "default"
  * @param {number} [item.minutes]
  * @param {number} [item.alarmMinutes]
+ * @param {number} [item.sequence]
+ * @param {Date}   [item.lastModified]
  */
-export function toEvent(item, idx = 0) {
+export function toEvent(item) {
   const [h, m] = (item.time || "12:00").split(":").map(Number);
   const start = new Date(`${item.date}T00:00:00`);
   start.setHours(h || 12, m || 0, 0, 0);
+  const slot =
+    item.slot || (item.kind === "training" ? "training" : item.kind === "campaign" ? "campaign" : "event");
   return {
-    uid: `maiming-${item.kind}-${item.date}-${idx}@maiming.local`,
+    uid:
+      item.uid ||
+      buildUid({
+        userScope: item.userScope || "local",
+        planId: item.planId || "default",
+        date: item.date,
+        slot,
+        type: item.kind || "meal",
+      }),
     summary: item.title,
     start,
     minutes: item.minutes || 30,
     description: item.desc || "",
     location: item.location || "",
     alarmMinutes: item.alarmMinutes != null ? item.alarmMinutes : 15,
+    sequence: item.sequence,
+    lastModified: item.lastModified,
   };
 }
 
 /**
  * 从「日历计划」生成 .ics。
- * @param {Array} schedule [{date,time,kind,title,desc,minutes,alarmMinutes}]
+ * @param {Array} schedule [{date,time,kind,title,desc,slot,minutes,alarmMinutes}]
  */
 export function scheduleToIcs(schedule, meta = {}) {
-  const events = schedule.map((s, i) => toEvent(s, i));
+  const events = schedule.map((s) => toEvent(s));
   return buildIcs(events, meta);
 }
